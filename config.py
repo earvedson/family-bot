@@ -14,22 +14,46 @@ if _env_path.exists():
             if key and key not in os.environ:
                 os.environ[key] = value
 
-# School classes: one entry per class. Format: label|url,label|url
-# Example: ClassA|https://example.com/school/a,ClassB|https://example.com/school/b
-# Labels are shown in the digest; update when classes or school year change.
-_school_raw = os.environ.get("SCHOOL_CLASSES", "")
-SCHOOL_CLASSES: list[tuple[str, str]] = []
-for entry in _school_raw.split(","):
-    entry = entry.strip()
-    if not entry:
-        continue
-    if "|" in entry:
+# Person + school class: one entry per person who has a class page. Format: Name|ClassLabel|URL
+# Example: Alice|6B|https://...,Bob|8B|https://... (names and class labels are configurable)
+# Fallback: if PERSON_SCHOOL empty but SCHOOL_CLASSES set, use Label|URL as (Label, Label, URL)
+_person_school_raw = os.environ.get("PERSON_SCHOOL", "")
+_school_classes_raw = os.environ.get("SCHOOL_CLASSES", "")
+PERSON_SCHOOL: list[tuple[str, str, str]] = []
+if _person_school_raw:
+    for entry in _person_school_raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [p.strip() for p in entry.split("|")]
+        if len(parts) >= 3 and all(parts[:3]):
+            PERSON_SCHOOL.append((parts[0], parts[1], parts[2]))
+elif _school_classes_raw:
+    for entry in _school_classes_raw.split(","):
+        entry = entry.strip()
+        if not entry or "|" not in entry:
+            continue
         label, _, url = entry.partition("|")
         label, url = label.strip(), url.strip()
         if label and url:
-            SCHOOL_CLASSES.append((label, url))
+            PERSON_SCHOOL.append((label, label, url))
 
-# ICS calendar URLs: comma-separated list
+# Person(s) + calendar: Names|URL. Names = one person or "Name1;Name2" for shared calendar.
+# Same name can appear in multiple entries for multiple calendars.
+# Example: Alice|https://...,Bob|https://...,Alice;Bob|https://... (last = shared)
+_person_cal_raw = os.environ.get("PERSON_CALENDARS", "")
+PERSON_CALENDARS: list[tuple[list[str], str]] = []
+for entry in _person_cal_raw.split(","):
+    entry = entry.strip()
+    if not entry or "|" not in entry:
+        continue
+    names_part, _, url = entry.partition("|")
+    url = url.strip()
+    names = [n.strip() for n in names_part.split(";") if n.strip()]
+    if names and url:
+        PERSON_CALENDARS.append((names, url))
+
+# Fallback: global ICS URLs (no person); used when PERSON_CALENDARS is empty
 _ics = os.environ.get("ICS_URLS", "")
 ICS_URLS = [u.strip() for u in _ics.split(",") if u.strip()]
 

@@ -14,18 +14,20 @@ from school import fetch_all_school_info
 from calendar import fetch_events_next_week
 from digest import build_digest
 from discord_notify import send_digest
+from llm_improve import improve_digest
 
 
 def main() -> int:
     school_infos = fetch_all_school_info()
-    events = []
+    events_by_person: list[tuple[str, list]] = []
     calendar_error = None
     try:
-        events = fetch_events_next_week()
+        events_by_person = fetch_events_next_week()
     except Exception as e:
         calendar_error = str(e)
 
-    body = build_digest(school_infos, events, calendar_error=calendar_error)
+    body = build_digest(school_infos, events_by_person, calendar_error=calendar_error)
+    body = improve_digest(body)
 
     if not config.DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL is not set. Digest (not sent):", file=sys.stderr)

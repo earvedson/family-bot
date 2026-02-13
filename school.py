@@ -37,9 +37,10 @@ WEEK_REF = re.compile(r"\b[vV]\.?\s*\d+|vecka\s*\d+", re.IGNORECASE)
 
 @dataclass
 class SchoolInfo:
-    """Parsed school page info for one class."""
+    """Parsed school page info for one person's class."""
 
-    child_name: str
+    person_name: str
+    class_label: Optional[str]  # e.g. 6B; shown as "Name (6B)" in digest when set
     url: str
     week: Optional[int]
     highlights: list[str]
@@ -71,7 +72,7 @@ def _relevant_line(line: str) -> bool:
     return bool(IMPORTANT_KEYWORDS.search(line) or WEEK_REF.search(line))
 
 
-def _parse_page_text(text: str, url: str, child_name: str) -> SchoolInfo:
+def _parse_page_text(text: str, url: str, person_name: str, class_label: Optional[str]) -> SchoolInfo:
     """Parse full page text into structured highlights."""
     week = _extract_week(text)
     highlights: list[str] = []
@@ -109,21 +110,23 @@ def _parse_page_text(text: str, url: str, child_name: str) -> SchoolInfo:
             unique.append(h)
 
     return SchoolInfo(
-        child_name=child_name,
+        person_name=person_name,
+        class_label=class_label,
         url=url,
         week=week,
         highlights=unique,
     )
 
 
-def fetch_school_info_for_class(label: str, url: str) -> SchoolInfo:
-    """Fetch and parse one school class page."""
+def fetch_school_info_for_person(person_name: str, class_label: Optional[str], url: str) -> SchoolInfo:
+    """Fetch and parse one school class page for a person."""
     try:
         text = _get_page_text(url)
-        return _parse_page_text(text, url, label)
+        return _parse_page_text(text, url, person_name, class_label)
     except Exception as e:
         return SchoolInfo(
-            child_name=label,
+            person_name=person_name,
+            class_label=class_label,
             url=url,
             week=None,
             highlights=[],
@@ -132,18 +135,19 @@ def fetch_school_info_for_class(label: str, url: str) -> SchoolInfo:
 
 
 def fetch_all_school_info() -> list[SchoolInfo]:
-    """Fetch and parse all configured school class pages (from SCHOOL_CLASSES)."""
-    if not config.SCHOOL_CLASSES:
+    """Fetch and parse all configured person school pages (from PERSON_SCHOOL)."""
+    if not config.PERSON_SCHOOL:
         return [
             SchoolInfo(
-                child_name="(configure SCHOOL_CLASSES)",
+                person_name="(configure PERSON_SCHOOL)",
+                class_label=None,
                 url="",
                 week=None,
                 highlights=[],
-                error="SCHOOL_CLASSES not set in .env (format: label|url,label|url)",
+                error="PERSON_SCHOOL not set in .env (format: Name|ClassLabel|URL,...)",
             )
         ]
     return [
-        fetch_school_info_for_class(label, url)
-        for label, url in config.SCHOOL_CLASSES
+        fetch_school_info_for_person(person_name, class_label, url)
+        for person_name, class_label, url in config.PERSON_SCHOOL
     ]

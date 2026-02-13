@@ -13,15 +13,23 @@ def _format_event(e: CalendarEvent) -> str:
     return line
 
 
+def _school_heading(info: SchoolInfo) -> str:
+    """Display heading for one person's school section (Name or Name (ClassLabel))."""
+    if info.class_label:
+        return f"{info.person_name} ({info.class_label})"
+    return info.person_name
+
+
 def build_digest(
     school_infos: list[SchoolInfo],
-    events: list[CalendarEvent],
+    events_by_person: list[tuple[str, list[CalendarEvent]]],
     week_label: str | None = None,
     calendar_error: str | None = None,
 ) -> str:
     """
     Build the full digest text (markdown-style for Discord).
 
+    events_by_person: list of (person_name, events). person_name "" = global calendar.
     If week_label is None, it is derived from the first school info that has a week number.
     If calendar_error is set, the calendar section shows that instead of events.
     """
@@ -43,28 +51,37 @@ def build_digest(
     parts.append("## Skola")
     any_school_error = False
     for info in school_infos:
+        heading = _school_heading(info)
         if info.error:
-            parts.append(f"**{info.child_name}:** Kunde inte hämta sidan – {info.error}")
+            parts.append(f"**{heading}:** Kunde inte hämta sidan – {info.error}")
             any_school_error = True
         elif info.highlights:
-            parts.append(f"**{info.child_name}:**")
+            parts.append(f"**{heading}:**")
             for h in info.highlights:
                 parts.append(h)
             parts.append("")
         else:
-            parts.append(f"**{info.child_name}:** Inga prov/läxor/förhör hittade denna vecka.")
+            parts.append(f"**{heading}:** Inga prov/läxor/förhör hittade denna vecka.")
             parts.append("")
     if any_school_error:
         parts.append("*(Kontrollera att skolsidorna är tillgängliga.)*")
         parts.append("")
 
-    # Calendar section
+    # Calendar section (per person or single global)
     parts.append("## Kalender")
     if calendar_error:
         parts.append(f"*Kunde inte hämta kalender: {calendar_error}*")
-    elif events:
-        for e in events:
-            parts.append(_format_event(e))
+    elif events_by_person:
+        for person_name, events in events_by_person:
+            subheading = person_name if person_name else "Övrigt"
+            if events:
+                parts.append(f"**{subheading}:**")
+                for e in events:
+                    parts.append(_format_event(e))
+                parts.append("")
+            else:
+                parts.append(f"**{subheading}:** Inga händelser.")
+                parts.append("")
     else:
         parts.append("Inga händelser de närmaste 7 dagarna.")
     parts.append("")

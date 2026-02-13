@@ -1,5 +1,6 @@
 """Fetch ICS calendar URLs and return events for the coming week."""
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -63,40 +64,60 @@ def _get_events_from_ics(ics_text: str) -> list[CalendarEvent]:
     return events
 
 
-def fetch_events(
-    days_ahead: int = 7,
-    from_date: datetime | None = None,
+def _fetch_events_from_urls(
+    urls: list[str],
+    from_date: datetime,
+    end_date: datetime,
 ) -> list[CalendarEvent]:
-    """
-    Fetch all configured ICS URLs and return events within the next days_ahead days.
-
-    If from_date is given, use it as the start of the window; otherwise use now (UTC).
-    """
-    if from_date is None:
-        from_date = datetime.now(timezone.utc)
-    end_date = from_date + timedelta(days=days_ahead)
-    all_events: list[CalendarEvent] = []
-
-    for url in config.ICS_URLS:
+    """Fetch and filter events from a list of ICS URLs."""
+    events: list[CalendarEvent] = []
+    for url in urls:
         if not url:
             continue
         try:
             resp = httpx.get(url, follow_redirects=True, timeout=15.0)
             resp.raise_for_status()
-            events = _get_events_from_ics(resp.text)
-            for e in events:
+            for e in _get_events_from_ics(resp.text):
                 if from_date <= e.start <= end_date:
-                    all_events.append(e)
+                    events.append(e)
         except Exception:
-            # Skip failed calendars; digest can still show the rest
             continue
+    events.sort(key=lambda e: e.start)
+    return events
 
-    all_events.sort(key=lambda e: e.start)
-    return all_events
 
-
-def fetch_events_next_week(from_date: datetime | None = None) -> list[CalendarEvent]:
+def fetch_events_next_week(
+    from_date: datetime | None = None,
+) -> list[tuple[str, list[CalendarEvent]]]:
     """
-    Fetch events for the next 7 days (e.g. for a weekly digest sent on Sunday).
+    Fetch events for the next 7 days, grouped by person.
+
+    Returns list of (person_name, events). person_name is "" for global ICS_URLS.
+    If PERSON_CALENDARS is set, each entry is (name, that person's events).
+    Otherwise uses ICS_URLS as a single global calendar with person_name "".
     """
-    return fetch_events(days_ahead=7, from_date=from_date)
+    if from_date is None:
+        from_date = datetime.now(timezone.utc)
+    end_date = from_date + timedelta(days=7)
+    result: list[tuple[str, list[CalendarEvent]]] = []
+
+    if config.PERSON_CALENDARS:
+        # Fetch each URL once (shared calendars may appear in multiple entries)
+        unique_urls = list({url for _, url in config.PERSON_CALENDARS})
+        url_to_events: dict[str, list[CalendarEvent]] = {
+            url: _fetch_events_from_urls([url], from_date, end_date)
+            for url in unique_urls
+        }
+        by_person_events: dict[str, list[CalendarEvent]] = defaultdict(list)
+        for names, url in config.PERSON_CALENDARS:
+            events = url_to_events.get(url, [])
+            for name in names:
+                by_person_events[name].extend(events)
+        for name in sorted(by_person_events.keys()):
+            events = by_person_events[name]
+            events.sort(key=lambda e: e.start)
+            result.append((name, events))
+    elif config.ICS_URLS:
+        events = _fetch_events_from_urls(config.ICS_URLS, from_date, end_date)
+        result.append(("", events))
+    return result
