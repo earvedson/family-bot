@@ -29,7 +29,13 @@ cp .env.example .env
 - **PERSON_SCHOOL** – Person + klass: format `Name|ClassLabel|URL`, kommaseparerat. T.ex. `Alice|6B|https://...,Bob|8B|https://...`. Namn och klassetikett (6B, 8B) är konfigurerbara; byt vid behov när klasser/år ändras.
 - **PERSON_CALENDARS** – Valfritt. Kalender kopplad till person(er): format `Names|ICS_URL`. `Names` är ett namn eller flera med `;` (t.ex. `Alice;Bob` = kalender för båda). Samma person kan ha flera kalendrar genom flera rader. Digesten grupperar händelser per person.
 - **ICS_URLS** – Valfritt (fallback). Global kalender om PERSON_CALENDARS inte är satt. Kommaseparerade ICS-URL:er.
-- **OPENAI_API_KEY** – Valfritt. Om satt körs digesten genom en LLM som kan lägga till en kort sammanfattning och förtydliga formuleringar. Kräver `pip install openai`. Modell: **OPENAI_DIGEST_MODEL** (standard: gpt-4o-mini).
+- **OPENAI_API_KEY** – Valfritt. Om satt skickas skol- och kalenderdata till en LLM som skriver hela veckosammanfattningen (rubrik, inledning, Skola, Kalender). Kräver `pip install openai`. Modell: **OPENAI_DIGEST_MODEL** (standard: gpt-4o-mini).
+- **USE_LLM_EXTRACTION** – Valfritt. Sätt till `1` (eller `true`/`yes`) för att låta LLM plocka ut skolinfo direkt från rå sidtext istället för regelbaserat filter. Rekommenderas om innehållet saknas eller filtreringen blir fel; kräver **OPENAI_API_KEY**.
+- **CALENDAR_TIMEZONE** – Valfritt. Tidszon för kalenderveckan och händelsetider (t.ex. Europe/Stockholm). Standard: Europe/Stockholm.
+
+**Kalender:** Händelser hämtas för nästa veckas måndag–söndag (samma vecka som skolinfo). I digesten visas kalendern **dag för dag**: under varje veckodag (t.ex. "Måndag 17 februari") listas vad varje person har den dagen. Om du har en kalender med namnet **Familjen** (t.ex. `Familjen|webcal://...`) tolkas den som att hela familjen gör något tillsammans; det nämns i veckosammanfattningen högst upp.
+
+**Veckofilter (skola):** Skolsidorna är ofta ostrukturerade och listar planering för många veckor. Boten fokuserar på *nästa vecka* (räknat från kördatum). Två lägen: (1) **Regelbaserat** (standard): `school.py` filtrerar rader som nämner nästa vecka; om OPENAI_API_KEY är satt kan LLM därefter städa digesten. (2) **USE_LLM_EXTRACTION=1**: LLM får rå sidtext och plockar ut endast det som gäller nästa vecka – ofta bättre när sidor varierar i upplägg. Kör gärna söndag så att "nästa vecka" blir veckan som börjar måndag.
 
 Om du publicerar repot: alla känsliga och hemspecifika värden ska ligga i `.env`. Committa bara `.env.example` (utan riktiga värden). Kontrollera att `.env` finns i `.gitignore`.
 
@@ -40,6 +46,16 @@ python run_weekly.py
 ```
 
 Om `DISCORD_WEBHOOK_URL` inte är satt skrivs digesten ut i stderr och skriptet avslutar med felkod 1.
+
+**För att granska och justera filtreringen** (skickas inte till Discord):
+
+```bash
+python run_weekly.py --dry-run
+```
+
+Digesten sparas i `digest_preview.txt`. Öppna filen, granska innehållet, ändra t.ex. `school.py` (veckofilter, ämnesrubriker) eller `llm_improve.py` (LLM-prompt) och kör `--dry-run` igen tills resultatet är bra. Annat filnamn: `python run_weekly.py --dry-run -o min_preview.txt`.
+
+**Skriv ut en viss vecka:** `python run_weekly.py --dry-run --week 8` ger digest för ISO vecka 8 (nuvarande år). Använd `--year 2025` för ett visst år, t.ex. `python run_weekly.py --dry-run -w 10 -y 2025`.
 
 ## Schemaläggning med cron
 
@@ -67,9 +83,9 @@ Se till att cron har tillgång till samma miljö om du använder `.env` (kör fr
 ## Projektstruktur
 
 - `config.py` – Läser URL:er och webhook från miljö/`.env`
-- `school.py` – Hämtar och parsar konfigurerade klassidor (prov, läxor, förhör)
-- `calendar.py` – Hämtar ICS-URL:er och listar händelser per person (enstaka eller delade kalendrar)
-- `digest.py` – Bygger meddelandet (skola + kalender)
-- `llm_improve.py` – Valfritt: skickar digesten till en LLM för förtydligande/sammanfattning (kräver OPENAI_API_KEY)
+- `school.py` – Hämtar och parsar konfigurerade klassidor (prov, läxor, förhör); filtrerar till nästa vecka
+- `cal_fetcher.py` – Hämtar ICS för måndag–söndag i målveckan, händelser per person; återkommande händelser (RRULE) expanderas till varje förekomst (kräver `recurring-ical-events`)
+- `digest.py` – Bygger meddelandet (skola + kalender dag för dag)
+- `llm_improve.py` – Valfritt: skickar digesten till en LLM för förtydligande, veckofilter på Skola-delen och sammanfattning (kräver OPENAI_API_KEY)
 - `discord_notify.py` – Skickar till Discord via webhook
 - `run_weekly.py` – Entry point för cron

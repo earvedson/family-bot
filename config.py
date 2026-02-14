@@ -3,15 +3,16 @@
 import os
 from pathlib import Path
 
-# Load .env file if present (simple parse, no extra dependency)
+# Load .env file if present (simple parse, no extra dependency). .env overrides existing env so changes take effect.
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            key = key.strip()
+            value = value.split("#")[0].strip().strip('"').strip("'")  # drop inline comments
+            if key:
                 os.environ[key] = value
 
 # Person + school class: one entry per person who has a class page. Format: Name|ClassLabel|URL
@@ -59,3 +60,13 @@ ICS_URLS = [u.strip() for u in _ics.split(",") if u.strip()]
 
 # Discord webhook URL (required for sending)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+# Use LLM to extract school highlights from raw page text (OPENAI_API_KEY required).
+# When True, rule-based filtering in school.py is skipped; the LLM does week filtering and relevance.
+USE_LLM_EXTRACTION = os.environ.get("USE_LLM_EXTRACTION", "").strip().lower() in ("1", "true", "yes")
+
+# Timezone for calendar week and event display (e.g. Europe/Stockholm). Used for target-week range and day labels.
+CALENDAR_TIMEZONE = os.environ.get("CALENDAR_TIMEZONE", "Europe/Stockholm").strip() or "Europe/Stockholm"
+
+# OpenAI model for digest (create_weekly_overview) and school extraction. Must be a Chat Completions model ID.
+OPENAI_DIGEST_MODEL = (os.environ.get("OPENAI_DIGEST_MODEL") or "gpt-4o-mini").strip()

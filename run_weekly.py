@@ -5,29 +5,145 @@ Run the weekly digest: fetch school info, calendar events, build message, send t
 Run once per week via cron, e.g.:
   Sunday 18:00:  0 18 * * 0  cd /path/to/family-bot && python run_weekly.py
   Monday 07:00:  0 7 * * 1   cd /path/to/family-bot && python run_weekly.py
+
+When run (e.g. Sunday), the digest focuses on *next* week (ISO week number).
+If OPENAI_API_KEY is set, school and calendar data are sent to the LLM, which
+produces the full weekly overview. Otherwise the digest is built from templates (build_digest).
+
+Capture mode (for reviewing and improving filtering):
+  python run_weekly.py --dry-run              # Write digest to digest_preview.txt, do not send
+  python run_weekly.py --dry-run -o out.txt  # Write to out.txt instead
+
+Any week (default is next week):
+  python run_weekly.py --dry-run --week 8     # Digest for ISO week 8 (current year)
+  python run_weekly.py --dry-run -w 10 -y 2025  # Digest for week 10 of 2025
 """
 
+import argparse
+import os
 import sys
+from datetime import date, timedelta
+from pathlib import Path
 
 import config
-from school import fetch_all_school_info
-from calendar import fetch_events_next_week
+from school import fetch_all_school_info, fetch_all_raw_school_texts, SchoolInfo
+from cal_fetcher import fetch_events_for_week
 from digest import build_digest
 from discord_notify import send_digest
-from llm_improve import improve_digest
+from llm_improve import create_weekly_overview, extract_school_highlights
+
+DEFAULT_PREVIEW_FILE = "digest_preview.txt"
+
+
+def _next_week_number() -> int:
+    """ISO week number for the week after today (the week we're summarising for)."""
+    next_week_date = date.today() + timedelta(days=7)
+    return next_week_date.isocalendar().week
 
 
 def main() -> int:
-    school_infos = fetch_all_school_info()
+    parser = argparse.ArgumentParser(
+        description="Run weekly digest (send to Discord or write to file for review)."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build digest and write to file; do not send to Discord. Use to review and tune filtering.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        default=DEFAULT_PREVIEW_FILE,
+        help=f"Output file for --dry-run (default: {DEFAULT_PREVIEW_FILE})",
+    )
+    parser.add_argument(
+        "-w",
+        "--week",
+        metavar="N",
+        type=int,
+        default=None,
+        help="ISO week number to use (default: next week). Use with --year to pick year.",
+    )
+    parser.add_argument(
+        "-y",
+        "--year",
+        metavar="Y",
+        type=int,
+        default=None,
+        help="ISO year for --week (default: current year when --week is set).",
+    )
+    args = parser.parse_args()
+
+    if args.week is not None:
+        target_week = args.week
+        year = args.year if args.year is not None else date.today().isocalendar()[0]
+        # reference_date so that (reference_date + 7) falls in target_week of year
+        monday_of_week = date.fromisocalendar(year, target_week, 1)
+        reference_date = monday_of_week - timedelta(days=7)
+    else:
+        target_week = _next_week_number()
+        reference_date = date.today()
+
+    if config.USE_LLM_EXTRACTION:
+        # LLM extracts relevant items from raw page text (no rule-based filtering)
+        school_infos = []
+        for person_name, class_label, url, raw_text, err in fetch_all_raw_school_texts():
+            if err:
+                school_infos.append(SchoolInfo(
+                    person_name=person_name,
+                    class_label=class_label,
+                    url=url,
+                    week=target_week,
+                    highlights=[],
+                    error=err,
+                ))
+            else:
+                highlights = extract_school_highlights(
+                    raw_text, person_name, class_label, target_week
+                )
+                school_infos.append(SchoolInfo(
+                    person_name=person_name,
+                    class_label=class_label,
+                    url=url,
+                    week=target_week,
+                    highlights=highlights,
+                    error=None,
+                ))
+    else:
+        school_infos = fetch_all_school_info(target_week=target_week)
     events_by_person: list[tuple[str, list]] = []
     calendar_error = None
     try:
-        events_by_person = fetch_events_next_week()
+        events_by_person = fetch_events_for_week(target_week, reference_date=reference_date)
     except Exception as e:
         calendar_error = str(e)
 
-    body = build_digest(school_infos, events_by_person, calendar_error=calendar_error)
-    body = improve_digest(body)
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        body = create_weekly_overview(
+            school_infos,
+            events_by_person,
+            target_week,
+            calendar_error=calendar_error,
+            reference_date=reference_date,
+        )
+    else:
+        body = build_digest(
+            school_infos,
+            events_by_person,
+            calendar_error=calendar_error,
+            target_week=target_week,
+            reference_date=reference_date,
+        )
+
+    if args.dry_run:
+        out_path = Path(args.output)
+        out_path.write_text(body, encoding="utf-8")
+        week_year = (reference_date + timedelta(days=7)).isocalendar()[0]
+        print(f"Target week: {target_week} (year {week_year})", file=sys.stderr)
+        print(f"Preview written to: {out_path.absolute()}", file=sys.stderr)
+        print("(Not sent to Discord. Adjust filtering in school.py / llm_improve.py and run again.)", file=sys.stderr)
+        return 0
 
     if not config.DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL is not set. Digest (not sent):", file=sys.stderr)
