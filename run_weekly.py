@@ -26,11 +26,15 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import config
-from school import fetch_all_school_info, fetch_all_raw_school_texts, SchoolInfo
+from school import fetch_all_school_info, fetch_all_raw_school_texts
 from cal_fetcher import fetch_events_for_week
 from digest import build_digest
 from discord_notify import send_digest
-from llm_improve import create_weekly_overview, extract_school_highlights
+from llm_improve import (
+    create_weekly_overview,
+    create_weekly_overview_from_raw,
+    _raw_blocks_to_school_infos,
+)
 
 DEFAULT_PREVIEW_FILE = "digest_preview.txt"
 
@@ -86,32 +90,15 @@ def main() -> int:
         reference_date = date.today()
 
     if config.USE_LLM_EXTRACTION:
-        # LLM extracts relevant items from raw page text (no rule-based filtering)
-        school_infos = []
-        for person_name, class_label, url, raw_text, err in fetch_all_raw_school_texts():
-            if err:
-                school_infos.append(SchoolInfo(
-                    person_name=person_name,
-                    class_label=class_label,
-                    url=url,
-                    week=target_week,
-                    highlights=[],
-                    error=err,
-                ))
-            else:
-                highlights = extract_school_highlights(
-                    raw_text, person_name, class_label, target_week
-                )
-                school_infos.append(SchoolInfo(
-                    person_name=person_name,
-                    class_label=class_label,
-                    url=url,
-                    week=target_week,
-                    highlights=highlights,
-                    error=None,
-                ))
+        raw_blocks = [
+            (person_name, class_label, raw_text, err)
+            for person_name, class_label, _url, raw_text, err in fetch_all_raw_school_texts()
+        ]
+        school_infos = None
     else:
         school_infos = fetch_all_school_info(target_week=target_week)
+        raw_blocks = None
+
     events_by_person: list[tuple[str, list]] = []
     calendar_error = None
     try:
@@ -119,7 +106,27 @@ def main() -> int:
     except Exception as e:
         calendar_error = str(e)
 
-    if os.environ.get("OPENAI_API_KEY", "").strip():
+    if config.USE_LLM_EXTRACTION:
+        has_openai_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        if has_openai_key:
+            body = create_weekly_overview_from_raw(
+                raw_blocks,
+                events_by_person,
+                target_week,
+                calendar_error=calendar_error,
+                reference_date=reference_date,
+            )
+        else:
+            print("OPENAI_API_KEY not set; using template digest.", file=sys.stderr)
+            school_infos = _raw_blocks_to_school_infos(raw_blocks, target_week)
+            body = build_digest(
+                school_infos,
+                events_by_person,
+                calendar_error=calendar_error,
+                target_week=target_week,
+                reference_date=reference_date,
+            )
+    elif os.environ.get("OPENAI_API_KEY", "").strip():
         body = create_weekly_overview(
             school_infos,
             events_by_person,

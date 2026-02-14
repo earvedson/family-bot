@@ -76,42 +76,28 @@ def _format_event(e: CalendarEvent) -> str:
     return line
 
 
-def _school_heading(info: SchoolInfo) -> str:
+def _school_heading_from_info(info: SchoolInfo) -> str:
     """Display heading for one person's school section (Name or Name (ClassLabel))."""
     if info.class_label:
         return f"{info.person_name} ({info.class_label})"
     return info.person_name
 
 
-def serialize_school_and_calendar_for_llm(
-    school_infos: list[SchoolInfo],
+def _school_heading_from_name_class(person_name: str, class_label: str | None) -> str:
+    """Display heading for one person (Name or Name (ClassLabel))."""
+    if class_label:
+        return f"{person_name} ({class_label})"
+    return person_name
+
+
+def _serialize_calendar_for_llm(
     events_by_person: list[tuple[str, list[CalendarEvent]]],
     target_week: int,
     calendar_error: str | None = None,
     reference_date: date | None = None,
 ) -> str:
-    """
-    Serialize school and calendar data into a single text block for the LLM.
-    The LLM will use this to produce the final weekly overview (title, intro, ## Skola, ## Kalender).
-    """
+    """Serialize only the calendar section for the LLM (day-by-day, person/events)."""
     lines: list[str] = []
-    lines.append(f"VECKA: {target_week}")
-    lines.append("")
-    lines.append("SKOLA")
-    lines.append("---")
-    for info in school_infos:
-        heading = _school_heading(info)
-        if info.error:
-            lines.append(f"{heading}: Fel – {info.error}")
-        elif info.highlights:
-            lines.append(f"{heading}:")
-            for h in info.highlights:
-                lines.append(f"- {h}")
-        else:
-            lines.append(f"{heading}: Inga prov/läxor/förhör denna vecka.")
-        lines.append("")
-    lines.append("---")
-    lines.append("")
     lines.append(f"KALENDER (vecka {target_week})")
     lines.append("---")
     if calendar_error:
@@ -140,6 +126,89 @@ def serialize_school_and_calendar_for_llm(
         lines.append("Inga kalenderhändelser.")
     lines.append("---")
     return "\n".join(lines).strip()
+
+
+def serialize_school_and_calendar_for_llm(
+    school_infos: list[SchoolInfo],
+    events_by_person: list[tuple[str, list[CalendarEvent]]],
+    target_week: int,
+    calendar_error: str | None = None,
+    reference_date: date | None = None,
+) -> str:
+    """
+    Serialize school and calendar data into a single text block for the LLM.
+    The LLM will use this to produce the final weekly overview (title, intro, ## Skola, ## Kalender).
+    """
+    lines: list[str] = []
+    lines.append(f"VECKA: {target_week}")
+    lines.append("")
+    lines.append("SKOLA")
+    lines.append("---")
+    for info in school_infos:
+        heading = _school_heading_from_info(info)
+        if info.error:
+            lines.append(f"{heading}: Fel – {info.error}")
+        elif info.highlights:
+            lines.append(f"{heading}:")
+            for h in info.highlights:
+                lines.append(f"- {h}")
+        else:
+            lines.append(f"{heading}: Inga prov/läxor/förhör denna vecka.")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(_serialize_calendar_for_llm(
+        events_by_person, target_week, calendar_error, reference_date
+    ))
+    return "\n".join(lines).strip()
+
+
+# Total payload cap (chars) for raw-school + calendar single-call
+_RAW_PAYLOAD_CAP = 30_000
+
+
+def serialize_raw_school_and_calendar_for_llm(
+    raw_blocks: list[tuple[str, str | None, str | None, str | None]],
+    events_by_person: list[tuple[str, list[CalendarEvent]]],
+    target_week: int,
+    calendar_error: str | None = None,
+    reference_date: date | None = None,
+) -> str:
+    """
+    Serialize raw school page text (per person) + calendar for a single LLM call.
+    raw_blocks: list of (person_name, class_label, raw_text, error) per school page.
+    Keeps total payload under _RAW_PAYLOAD_CAP; reserves space for calendar,
+    splits the rest evenly across persons (truncating each raw_text if needed).
+    """
+    calendar_section = _serialize_calendar_for_llm(
+        events_by_person, target_week, calendar_error, reference_date
+    )
+    header_lines = [f"VECKA: {target_week}", "", "SKOLA", "---"]
+    header = "\n".join(header_lines) + "\n"
+    trailer = "\n---\n\n" + calendar_section
+    school_budget = _RAW_PAYLOAD_CAP - len(header) - len(trailer) - 200
+    n = max(1, len(raw_blocks))
+    per_person = max(500, school_budget // n)
+    lines: list[str] = list(header_lines)
+    for person_name, class_label, raw_text, err in raw_blocks:
+        heading = _school_heading_from_name_class(person_name, class_label)
+        if err:
+            lines.append(f"--- SKOLA: {heading} ---")
+            lines.append(f"{heading}: Fel – {err}")
+        else:
+            text = (raw_text or "").strip()
+            if len(text) > per_person:
+                text = text[: per_person - 20] + "\n... [trunkerad]"
+            lines.append(f"--- SKOLA: {heading} ---")
+            lines.append(text)
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(calendar_section)
+    payload = "\n".join(lines).strip()
+    if len(payload) > _RAW_PAYLOAD_CAP:
+        payload = payload[: _RAW_PAYLOAD_CAP - 50] + "\n... [payload trunkerad]"
+    return payload
 
 
 def build_digest(
@@ -194,7 +263,7 @@ def build_digest(
     parts.append("## Skola")
     any_school_error = False
     for info in school_infos:
-        heading = _school_heading(info)
+        heading = _school_heading_from_info(info)
         if info.error:
             parts.append(f"**{heading}:** Kunde inte hämta sidan – {info.error}")
             any_school_error = True

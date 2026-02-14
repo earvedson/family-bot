@@ -30,12 +30,12 @@ cp .env.example .env
 - **PERSON_CALENDARS** – Valfritt. Kalender kopplad till person(er): format `Names|ICS_URL`. `Names` är ett namn eller flera med `;` (t.ex. `Alice;Bob` = kalender för båda). Samma person kan ha flera kalendrar genom flera rader. Digesten grupperar händelser per person.
 - **ICS_URLS** – Valfritt (fallback). Global kalender om PERSON_CALENDARS inte är satt. Kommaseparerade ICS-URL:er.
 - **OPENAI_API_KEY** – Valfritt. Om satt skickas skol- och kalenderdata till en LLM som skriver hela veckosammanfattningen (rubrik, inledning, Skola, Kalender). Kräver `pip install openai`. Modell: **OPENAI_DIGEST_MODEL** (standard: gpt-4o-mini).
-- **USE_LLM_EXTRACTION** – Valfritt. Sätt till `1` (eller `true`/`yes`) för att låta LLM plocka ut skolinfo direkt från rå sidtext istället för regelbaserat filter. Rekommenderas om innehållet saknas eller filtreringen blir fel; kräver **OPENAI_API_KEY**.
+- **USE_LLM_EXTRACTION** – Valfritt. Sätt till `1` (eller `true`/`yes`) för att skicka rå sidtext per barn + kalender i ett enda LLM-anrop som returnerar hela veckosammanfattningen. Rekommenderas om innehållet saknas eller regelbaserat filter blir fel; kräver **OPENAI_API_KEY**.
 - **CALENDAR_TIMEZONE** – Valfritt. Tidszon för kalenderveckan och händelsetider (t.ex. Europe/Stockholm). Standard: Europe/Stockholm.
 
 **Kalender:** Händelser hämtas för nästa veckas måndag–söndag (samma vecka som skolinfo). I digesten visas kalendern **dag för dag**: under varje veckodag (t.ex. "Måndag 17 februari") listas vad varje person har den dagen. Om du har en kalender med namnet **Familjen** (t.ex. `Familjen|webcal://...`) tolkas den som att hela familjen gör något tillsammans; det nämns i veckosammanfattningen högst upp.
 
-**Veckofilter (skola):** Skolsidorna är ofta ostrukturerade och listar planering för många veckor. Boten fokuserar på *nästa vecka* (räknat från kördatum). Två lägen: (1) **Regelbaserat** (standard): `school.py` filtrerar rader som nämner nästa vecka; om OPENAI_API_KEY är satt kan LLM därefter städa digesten. (2) **USE_LLM_EXTRACTION=1**: LLM får rå sidtext och plockar ut endast det som gäller nästa vecka – ofta bättre när sidor varierar i upplägg. Kör gärna söndag så att "nästa vecka" blir veckan som börjar måndag.
+**Veckofilter (skola):** Skolsidorna är ofta ostrukturerade och listar planering för många veckor. Boten fokuserar på *nästa vecka* (räknat från kördatum). Två lägen: (1) **Regelbaserat** (standard): `school.py` filtrerar rader som nämner nästa vecka; om OPENAI_API_KEY är satt skriver LLM hela digesten utifrån den data. (2) **USE_LLM_EXTRACTION=1**: Ett enda LLM-anrop får rå sidtext per barn och kalender, extraherar skolinfo för nästa vecka och skriver hela veckosammanfattningen – ofta bättre när sidor varierar i upplägg. Kör gärna söndag så att "nästa vecka" blir veckan som börjar måndag.
 
 Om du publicerar repot: alla känsliga och hemspecifika värden ska ligga i `.env`. Committa bara `.env.example` (utan riktiga värden). Kontrollera att `.env` finns i `.gitignore`.
 
@@ -78,7 +78,7 @@ Alternativt måndag 07:00:
 0 7 * * 1  cd /path/to/family-bot && .venv/bin/python run_weekly.py
 ```
 
-Se till att cron har tillgång till samma miljö om du använder `.env` (kör från projektdirectory så att `config.py` hittar `.env`).
+Se till att cron har tillgång till samma miljö om du använder `.env` (kör från projektdirectory så att `config.py` hittar `.env`). För steg-för-steg-installation på en Raspberry Pi, se [RASPBERRY_PI.md](RASPBERRY_PI.md).
 
 ## Projektstruktur
 
