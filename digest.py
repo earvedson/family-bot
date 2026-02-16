@@ -200,6 +200,9 @@ def serialize_raw_school_and_calendar_for_llm(
             if len(text) > per_person:
                 text = text[: per_person - 20] + "\n... [trunkerad]"
             lines.append(f"--- SKOLA: {heading} ---")
+            special = config.get_special_info(person_name)
+            if special:
+                lines.append(f"Observera: {special}.")
             lines.append(text)
         lines.append("")
     lines.append("---")
@@ -274,6 +277,10 @@ def build_digest(
             parts.append("")
         else:
             parts.append(f"**{heading}:** Inga prov/läxor/förhör hittade denna vecka.")
+            parts.append("")
+        special = config.get_special_info(info.person_name)
+        if special:
+            parts.append(f"*({info.person_name} har {special} denna termin.)*")
             parts.append("")
     if any_school_error:
         parts.append("*(Kontrollera att skolsidorna är tillgängliga.)*")

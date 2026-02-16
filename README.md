@@ -27,6 +27,7 @@ cp .env.example .env
 
 - **DISCORD_WEBHOOK_URL** – Skapa en Incoming Webhook i Discord: Kanalinställningar → Integrations → Webhooks → New Webhook, kopiera URL.
 - **PERSON_SCHOOL** – Person + klass: format `Name|ClassLabel|URL`, kommaseparerat. T.ex. `Alice|6B|https://...,Bob|8B|https://...`. Namn och klassetikett (6B, 8B) är konfigurerbara; byt vid behov när klasser/år ändras.
+- **SPECIAL_INFO_&lt;Name&gt;** – Valfritt. Per-person notiser (t.ex. ämnesbyten: "Bild (inte Musik); Slöjd (inte Hemkunskap)"). Namnet ska matcha PERSON_SCHOOL; nyckeln är SPECIAL_INFO_ + namnet i versaler med mellanslag ersatta med understreck (t.ex. `SPECIAL_INFO_OLLE=...`). Visas i digesten och skickas till LLM som kontext.
 - **PERSON_CALENDARS** – Valfritt. Kalender kopplad till person(er): format `Names|ICS_URL`. `Names` är ett namn eller flera med `;` (t.ex. `Alice;Bob` = kalender för båda). Samma person kan ha flera kalendrar genom flera rader. Digesten grupperar händelser per person.
 - **ICS_URLS** – Valfritt (fallback). Global kalender om PERSON_CALENDARS inte är satt. Kommaseparerade ICS-URL:er.
 - **OPENAI_API_KEY** – Valfritt. Om satt skickas skol- och kalenderdata till en LLM som skriver hela veckosammanfattningen (rubrik, inledning, Skola, Kalender). Kräver `pip install openai`. Modell: **OPENAI_DIGEST_MODEL** (standard: gpt-4o-mini).

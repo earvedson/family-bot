@@ -217,7 +217,7 @@ def create_weekly_overview_from_raw(
 2) KALENDER: dag för dag med person och händelser.
 
 Gör följande:
-A) Skolsektion: För varje persons block, plocka ut ENDAST de poster som gäller vecka {target_week} (och vid prov även efterföljande vecka). Vecka anges ofta som "v. 6", "v7-11" m.m. – kontrollera att vecka {target_week} ingår. Skriv under varje persons underrubrik (t.ex. **Olle (8B):**) BARA det du extraherade från just den personens block – flytta aldrig skolposter mellan personer. Format per post: **Ämne:** beskrivning. Markera prov med **PROV**.
+A) Skolsektion: För varje persons block, plocka ut ENDAST de poster som gäller vecka {target_week} (och vid prov även efterföljande vecka). Vecka anges ofta som "v. 6", "v7-11" m.m. – kontrollera att vecka {target_week} ingår. Om blocket innehåller en rad "Observera: ..." gäller den för just den personen: skriv INGET alls för de ämnen som nämns som "inte X" eller "ej X" (t.ex. "inte Musik" betyder att den personen inte har Musik – skriv då ingen rad för Musik, och skriv inte heller en anteckning om att det utelämnas; bara utelämna det helt). Skriv under varje persons underrubrik (t.ex. **Olle (8B):**) BARA det du extraherade från just den personens block – flytta aldrig skolposter mellan personer. Format per post: **Ämne:** beskrivning. Markera prov med **PROV**.
 B) Kalendern: Använd dag-för-dag-data. Om samma händelse flera gånger samma dag (olika tider), ange en gång med rimlig tid. Om en kalenderhändelse handlar om skolan (prov/läxa), skriv den i skolsektionen och inte i kalendern – undvik dubbelpost. Ta bort personens namn ur händelsetexten om det ingår.
 
 Utdataformat:

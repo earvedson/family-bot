@@ -1,6 +1,7 @@
 """Configuration loaded from environment variables."""
 
 import os
+import re
 from pathlib import Path
 
 # Load .env file if present (simple parse, no extra dependency). .env overrides existing env so changes take effect.
@@ -70,3 +71,14 @@ CALENDAR_TIMEZONE = os.environ.get("CALENDAR_TIMEZONE", "Europe/Stockholm").stri
 
 # OpenAI model for digest (create_weekly_overview) and school extraction. Must be a Chat Completions model ID.
 OPENAI_DIGEST_MODEL = (os.environ.get("OPENAI_DIGEST_MODEL") or "gpt-4o-mini").strip()
+
+
+def get_special_info(person_name: str) -> str | None:
+    """
+    Return optional per-person special info (e.g. subject swaps) from env.
+    Key: SPECIAL_INFO_<NAME> with name uppercased and non-alphanumeric chars replaced by underscore.
+    Person name must match the name used in PERSON_SCHOOL.
+    """
+    key = "SPECIAL_INFO_" + re.sub(r"[^A-Za-z0-9]+", "_", person_name).upper().strip("_")
+    value = (os.environ.get(key) or "").strip()
+    return value if value else None
