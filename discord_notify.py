@@ -50,8 +50,14 @@ def send_digest(content: str) -> None:
     if current:
         chunks.append("\n\n".join(current))
 
+    if chunks:
+        chunks[0] = "@here\n\n" + chunks[0]
+
     for chunk in chunks:
-        payload = {"content": chunk}
+        payload = {
+            "content": chunk,
+            "allowed_mentions": {"parse": ["everyone"]},
+        }
         resp = httpx.post(
             config.DISCORD_WEBHOOK_URL,
             json=payload,
