@@ -6,7 +6,8 @@ Run once per week via cron, e.g.:
   Sunday 18:00:  0 18 * * 0  cd /path/to/family-bot && python run_weekly.py
   Monday 07:00:  0 7 * * 1   cd /path/to/family-bot && python run_weekly.py
 
-When run (e.g. Sunday), the digest focuses on *next* week (ISO week number).
+Without --week: the digest targets the *current* week when run Monday–Friday,
+and *next* week when run Saturday or Sunday.
 If OPENAI_API_KEY is set, school and calendar data are sent to the LLM, which
 produces the full weekly overview. Otherwise the digest is built from templates (build_digest).
 
@@ -14,7 +15,7 @@ Capture mode (for reviewing and improving filtering):
   python run_weekly.py --dry-run              # Write digest to digest_preview.txt, do not send
   python run_weekly.py --dry-run -o out.txt  # Write to out.txt instead
 
-Any week (default is next week):
+Any week (default: current week Mon–Fri, next week Sat–Sun):
   python run_weekly.py --dry-run --week 8     # Digest for ISO week 8 (current year)
   python run_weekly.py --dry-run -w 10 -y 2025  # Digest for week 10 of 2025
 """
@@ -40,9 +41,22 @@ DEFAULT_PREVIEW_FILE = "digest_preview.txt"
 
 
 def _next_week_number() -> int:
-    """ISO week number for the week after today (the week we're summarising for)."""
+    """ISO week number for the week after today."""
     next_week_date = date.today() + timedelta(days=7)
     return next_week_date.isocalendar().week
+
+
+def _default_target_week_and_reference() -> tuple[int, date]:
+    """Default target week and reference_date by weekday. Mon–Fri → current week; Sat–Sun → next week."""
+    today = date.today()
+    if today.weekday() <= 4:  # Monday=0 .. Friday=4
+        iso_year, target_week, _ = today.isocalendar()
+        monday_of_week = date.fromisocalendar(iso_year, target_week, 1)
+        reference_date = monday_of_week - timedelta(days=7)
+        return target_week, reference_date
+    # Saturday=5, Sunday=6 → next week
+    target_week = _next_week_number()
+    return target_week, today
 
 
 def main() -> int:
@@ -67,7 +81,7 @@ def main() -> int:
         metavar="N",
         type=int,
         default=None,
-        help="ISO week number to use (default: next week). Use with --year to pick year.",
+        help="ISO week number to use (default: current week Mon–Fri, next week Sat–Sun). Use with --year to pick year.",
     )
     parser.add_argument(
         "-y",
@@ -86,8 +100,8 @@ def main() -> int:
         monday_of_week = date.fromisocalendar(year, target_week, 1)
         reference_date = monday_of_week - timedelta(days=7)
     else:
-        target_week = _next_week_number()
-        reference_date = date.today()
+        # Mon–Fri → current week; Sat–Sun → next week
+        target_week, reference_date = _default_target_week_and_reference()
 
     if config.USE_LLM_EXTRACTION:
         raw_blocks = [
