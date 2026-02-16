@@ -18,6 +18,9 @@ Capture mode (for reviewing and improving filtering):
 Any week (default: current week Mon–Fri, next week Sat–Sun):
   python run_weekly.py --dry-run --week 8     # Digest for ISO week 8 (current year)
   python run_weekly.py --dry-run -w 10 -y 2025  # Digest for week 10 of 2025
+
+Check-updates dry-run (see what would be sent without sending or updating snapshot):
+  python run_weekly.py --check-updates --dry-run
 """
 
 import argparse
@@ -34,7 +37,16 @@ from discord_notify import send_digest
 from llm_improve import (
     create_weekly_overview,
     create_weekly_overview_from_raw,
+    get_new_school_items_only,
     _raw_blocks_to_school_infos,
+)
+from snapshot import (
+    build_snapshot,
+    diff_snapshots,
+    format_notification,
+    load_snapshot,
+    save_snapshot,
+    snapshot_path,
 )
 
 DEFAULT_PREVIEW_FILE = "digest_preview.txt"
@@ -66,7 +78,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Build digest and write to file; do not send to Discord. Use to review and tune filtering.",
+        help="Do not send to Discord or update snapshot. With default mode: build digest and write to file. With --check-updates: print what would be sent, do not send or update snapshot.",
     )
     parser.add_argument(
         "-o",
@@ -91,7 +103,96 @@ def main() -> int:
         default=None,
         help="ISO year for --week (default: current year when --week is set).",
     )
+    parser.add_argument(
+        "--check-updates",
+        action="store_true",
+        help="Weekday mode: fetch current week, diff with stored snapshot, notify if changes, then update snapshot.",
+    )
+    parser.add_argument(
+        "--save-snapshot",
+        action="store_true",
+        help="Save a snapshot for the target week (e.g. with --dry-run to test without sending).",
+    )
     args = parser.parse_args()
+
+    # Weekday check-updates path: current week only, diff and notify
+    if args.check_updates:
+        today = date.today()
+        iso_year, target_week, _ = today.isocalendar()
+        monday_of_week = date.fromisocalendar(iso_year, target_week, 1)
+        reference_date = monday_of_week - timedelta(days=7)
+        if config.USE_LLM_EXTRACTION:
+            raw_blocks = [
+                (pn, cl, raw_text, err)
+                for pn, cl, _url, raw_text, err in fetch_all_raw_school_texts()
+            ]
+            school_infos = None
+        else:
+            school_infos = fetch_all_school_info(target_week=target_week)
+            raw_blocks = None
+        try:
+            events_by_person = fetch_events_for_week(target_week, reference_date=reference_date)
+        except Exception as e:
+            print(f"Calendar fetch failed: {e}", file=sys.stderr)
+            events_by_person = []
+        current = build_snapshot(
+            school_infos,
+            raw_blocks,
+            events_by_person,
+            target_week,
+            iso_year,
+            config.USE_LLM_EXTRACTION,
+        )
+        stored = load_snapshot(iso_year, target_week)
+        if stored is None:
+            print(f"No snapshot for week {target_week} ({iso_year}). Run full digest first (e.g. Sunday).", file=sys.stderr)
+            return 0
+        school_changed, new_events = diff_snapshots(stored, current)
+        if not school_changed and not new_events:
+            if args.dry_run:
+                print("Dry-run: no changes; would not send.", file=sys.stderr)
+            return 0
+        school_updates: dict[str, list[str]] = {}
+        if school_changed:
+            if "school_highlights" in stored and "school_highlights" in current:
+                for p in school_changed:
+                    cur_set = set(current["school_highlights"].get(p) or [])
+                    stored_set = set(stored["school_highlights"].get(p) or [])
+                    new_lines = list(cur_set - stored_set)
+                    if new_lines:
+                        school_updates[p] = new_lines
+            elif "school_digest_highlights" in stored and raw_blocks is not None:
+                person_to_raw = {pn: (raw or "") for (pn, _, raw, _) in raw_blocks}
+                for p in school_changed:
+                    previous = stored["school_digest_highlights"].get(p) or []
+                    raw_text = person_to_raw.get(p) or ""
+                    new_lines = get_new_school_items_only(p, previous, raw_text, target_week)
+                    if new_lines:
+                        school_updates[p] = new_lines
+        msg = format_notification(
+            target_week, iso_year, school_changed, new_events, school_updates=school_updates or None
+        )
+        if args.dry_run:
+            print("Dry-run: would send the following (Discord not called, snapshot not updated):", file=sys.stderr)
+            print(msg)
+            return 0
+        if not config.DISCORD_WEBHOOK_URL:
+            print("DISCORD_WEBHOOK_URL not set. Notification (not sent):", file=sys.stderr)
+            print(msg)
+            return 1
+        try:
+            send_digest(msg)
+            # Preserve school_digest_highlights so next run has updated "previous" baseline
+            if "school_digest_highlights" in stored:
+                current["school_digest_highlights"] = dict(stored.get("school_digest_highlights") or {})
+                for p, lines in school_updates.items():
+                    current["school_digest_highlights"].setdefault(p, []).extend(lines)
+            save_snapshot(current)
+            print("Updates sent to Discord; snapshot updated.", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to send notification: {e}", file=sys.stderr)
+            return 1
+        return 0
 
     if args.week is not None:
         target_week = args.week
@@ -157,6 +258,20 @@ def main() -> int:
             reference_date=reference_date,
         )
 
+    if args.save_snapshot:
+        iso_year = (reference_date + timedelta(days=7)).isocalendar()[0]
+        snapshot = build_snapshot(
+            school_infos,
+            raw_blocks,
+            events_by_person,
+            target_week,
+            iso_year,
+            config.USE_LLM_EXTRACTION,
+            digest_body=body,
+        )
+        save_snapshot(snapshot)
+        print(f"Snapshot saved to {snapshot_path(iso_year, target_week)}", file=sys.stderr)
+
     if args.dry_run:
         out_path = Path(args.output)
         out_path.write_text(body, encoding="utf-8")
@@ -174,6 +289,17 @@ def main() -> int:
     try:
         send_digest(body)
         print("Digest sent to Discord.")
+        iso_year = (reference_date + timedelta(days=7)).isocalendar()[0]
+        snapshot = build_snapshot(
+            school_infos,
+            raw_blocks,
+            events_by_person,
+            target_week,
+            iso_year,
+            config.USE_LLM_EXTRACTION,
+            digest_body=body,
+        )
+        save_snapshot(snapshot)
         return 0
     except Exception as e:
         print(f"Failed to send to Discord: {e}", file=sys.stderr)

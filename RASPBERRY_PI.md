@@ -106,7 +106,7 @@ sudo timedatectl set-timezone Europe/Stockholm
 
 ---
 
-## 6. Schedule weekly run with cron
+## 6. Schedule weekly run and weekday updates with cron
 
 Cron runs in a minimal environment (no venv activated, no `.env` from your shell). Use the **full path to the venv Python** and run from the **project directory** so `config.py` finds `.env`:
 
@@ -114,24 +114,26 @@ Cron runs in a minimal environment (no venv activated, no `.env` from your shell
 crontab -e
 ```
 
-Add one line (adjust `/home/pi/family-bot` to your actual path):
+Add lines (adjust `/home/pi/family-bot` to your actual path):
 
-**Sunday 18:00:**
+**Sunday 18:00 – full digest and save snapshot:**
 
 ```cron
 0 18 * * 0  cd /home/pi/family-bot && .venv/bin/python run_weekly.py
 ```
 
-**Or Monday 07:00:**
+**Weekdays 07:00 – check for updates and notify if anything changed:**
 
 ```cron
-0 7 * * 1  cd /home/pi/family-bot && .venv/bin/python run_weekly.py
+0 7 * * 1-5  cd /home/pi/family-bot && .venv/bin/python run_weekly.py --check-updates
 ```
 
+- Sunday: builds the digest for the coming week, sends it to Discord, and stores a snapshot in `.digest_snapshots/`.
+- Weekdays: fetches school and calendar again, compares with the stored snapshot; if there are new school or calendar updates, sends a short notification to Discord and updates the snapshot. If nothing changed, nothing is sent.
 - `cd ... &&` ensures the script runs with the project as current directory so `.env` is loaded.
 - `.venv/bin/python` uses the venv that has all dependencies; no `source` needed.
 
-Save and exit. Cron will run the script at the chosen time every week.
+Save and exit.
 
 ---
 

@@ -72,6 +72,12 @@ CALENDAR_TIMEZONE = os.environ.get("CALENDAR_TIMEZONE", "Europe/Stockholm").stri
 # OpenAI model for digest (create_weekly_overview) and school extraction. Must be a Chat Completions model ID.
 OPENAI_DIGEST_MODEL = (os.environ.get("OPENAI_DIGEST_MODEL") or "gpt-4o-mini").strip()
 
+# Directory for week snapshots (Sunday capture; weekday diff). Default: .digest_snapshots
+DIGEST_SNAPSHOT_DIR = (
+    os.environ.get("DIGEST_SNAPSHOT_DIR", "").strip()
+    or str(Path(__file__).resolve().parent / ".digest_snapshots")
+)
+
 
 def get_special_info(person_name: str) -> str | None:
     """

@@ -60,7 +60,7 @@ Digesten sparas i `digest_preview.txt`. Öppna filen, granska innehållet, ändr
 
 ## Schemaläggning med cron
 
-Kör en gång per vecka, t.ex. söndag 18:00 eller måndag 07:00:
+**Söndag:** Kör full veckosammanfattning (nästa vecka), skicka till Discord och spara en ögonblicksbild (snapshot) av data. **Vardagar (valfritt):** Kör `run_weekly.py --check-updates` – hämtar data igen, jämför med sparad ögonblicksbild; om något nytt (skola eller kalender) skickas en kort notis till Discord och ögonblicksbilden uppdateras.
 
 ```bash
 crontab -e
@@ -69,14 +69,17 @@ crontab -e
 Lägg till (ändra sökväg till din installation):
 
 ```cron
-# Söndag 18:00 – veckosammanfattning
+# Söndag 18:00 – veckosammanfattning + spara snapshot
 0 18 * * 0  cd /path/to/family-bot && .venv/bin/python run_weekly.py
+
+# Vardagar 07:00 – kolla uppdateringar, skicka notis vid ändringar
+0 7 * * 1-5  cd /path/to/family-bot && .venv/bin/python run_weekly.py --check-updates
 ```
 
-Alternativt måndag 07:00:
+Alternativt bara söndag (utan vardagsnotiser):
 
 ```cron
-0 7 * * 1  cd /path/to/family-bot && .venv/bin/python run_weekly.py
+0 18 * * 0  cd /path/to/family-bot && .venv/bin/python run_weekly.py
 ```
 
 Se till att cron har tillgång till samma miljö om du använder `.env` (kör från projektdirectory så att `config.py` hittar `.env`). För steg-för-steg-installation på en Raspberry Pi, se [RASPBERRY_PI.md](RASPBERRY_PI.md).
@@ -89,4 +92,5 @@ Se till att cron har tillgång till samma miljö om du använder `.env` (kör fr
 - `digest.py` – Bygger meddelandet (skola + kalender dag för dag)
 - `llm_improve.py` – Valfritt: skickar digesten till en LLM för förtydligande, veckofilter på Skola-delen och sammanfattning (kräver OPENAI_API_KEY)
 - `discord_notify.py` – Skickar till Discord via webhook
-- `run_weekly.py` – Entry point för cron
+- `run_weekly.py` – Entry point för cron; `--check-updates` för vardagsdiff och notis
+- `snapshot.py` – Sparar och jämför veckodata (söndag = spara, vardag = diff + notis vid ändringar)

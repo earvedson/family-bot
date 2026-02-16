@@ -96,6 +96,57 @@ Skriv inga rubriker eller förklaringar, bara raderna. """
         return []
 
 
+def get_new_school_items_only(
+    person_name: str,
+    previous_highlights: list[str],
+    current_raw_page_text: str,
+    target_week: int,
+) -> list[str]:
+    """
+    Ask the LLM to list ONLY new/changed school items for this person (not in previous_highlights).
+    Returns list of highlight lines in format **Ämne:** description, or [] if nothing new or on error.
+    """
+    client = _openai_client()
+    if not client:
+        return []
+    raw_cap = (current_raw_page_text or "")[:15000]
+    previous_blob = "\n".join(previous_highlights) if previous_highlights else "(inga tidigare poster)"
+    model = (os.environ.get("OPENAI_DIGEST_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    system = f"""Du är en assistent. Vi har tidigare skickat följande skolposter för {person_name}:
+{previous_blob}
+
+Nu har skolsidan uppdaterats. Din uppgift: Läs den aktuella sidtexten och lista ENDAST de poster som är NYA eller ÄNDRADE (som inte fanns i listan ovan) och som gäller vecka {target_week} (eller prov även senare). Samma format: en rad per post, **Ämne:** beskrivning. Markera prov med **PROV**. Om inget nytt eller ändrat finns, skriv exakt INGET."""
+    user = f"Aktuell sidtext för {person_name}:\n\n{raw_cap}"
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_completion_tokens=1024,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text or text.upper().strip() == "INGET":
+            return []
+        lines = []
+        for line in text.splitlines():
+            line = line.strip().strip("- ")
+            if not line:
+                continue
+            if re.match(r"^\*\*[^*]+\*\*:", line):
+                lines.append(line)
+            elif ":" in line and not line.startswith("#"):
+                sub, _, rest = line.partition(":")
+                sub = sub.strip().strip("*")
+                if sub and rest.strip():
+                    lines.append(f"**{sub}:** {rest.strip()}")
+        return lines
+    except Exception as e:
+        print(f"OpenAI API error (get_new_school_items_only): {e}", file=sys.stderr)
+        return []
+
+
 def create_weekly_overview(
     school_infos: list,
     events_by_person: list,
