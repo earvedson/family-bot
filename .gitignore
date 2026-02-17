@@ -6,3 +6,4 @@ __pycache__/
 *.egg-info/
 digest_preview.txt
 .digest_snapshots/
+.DS_Store

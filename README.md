@@ -2,6 +2,10 @@
 
 En bot som varje vecka sammanställer skolinfo (klassidor du konfigurerar) och kalenderhändelser (t.ex. iCloud via ICS) och skickar en sammanfattning till Discord.
 
+## Screenshots (anonymiserade via AI)
+![Veckosammanfattning i Discord](docs/screenshots/screenshot1.png)
+![Veckoschema i Discord](docs/screenshots/screenshot2.png)
+
 ## Krävs
 
 - Python 3.10+
