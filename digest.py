@@ -51,6 +51,32 @@ def _events_by_day_and_person(
     return dict(by_day)
 
 
+def _dedupe_events_same_day(
+    events: list[CalendarEvent],
+    tz: ZoneInfo | None,
+) -> list[CalendarEvent]:
+    """Keep one event per (summary, location) per list; prefer timed over all-day (midnight)."""
+    if not events or len(events) <= 1:
+        return events
+    key_to_events: dict[tuple[str, str], list[CalendarEvent]] = defaultdict(list)
+    for e in events:
+        loc = (e.location or "").strip()
+        key_to_events[(e.summary.strip(), loc)].append(e)
+    result: list[CalendarEvent] = []
+    for key, group in key_to_events.items():
+        def is_all_day(ev: CalendarEvent) -> bool:
+            if tz is not None and ev.start.tzinfo is not None:
+                local = ev.start.astimezone(tz)
+            else:
+                local = ev.start
+            return local.hour == 0 and local.minute == 0
+        # Prefer timed event over all-day (midnight)
+        group_sorted = sorted(group, key=is_all_day)
+        result.append(group_sorted[0])
+    result.sort(key=lambda x: x.start)
+    return result
+
+
 def _format_event_short(e: CalendarEvent, tz: ZoneInfo | None) -> str:
     """One event as 'HH:MM – Summary (location)' or 'Heldag – Summary'."""
     if tz is not None and e.start.tzinfo is not None:
@@ -119,7 +145,8 @@ def _serialize_calendar_for_llm(
                 lines.append("  Inga händelser.")
             else:
                 for person_name in sorted(persons_events.keys()):
-                    event_strs = [_format_event_short(e, tz) for e in persons_events[person_name]]
+                    deduped = _dedupe_events_same_day(persons_events[person_name], tz)
+                    event_strs = [_format_event_short(e, tz) for e in deduped]
                     lines.append(f"  {person_name}: " + ". ".join(event_strs))
             lines.append("")
     else:
@@ -307,7 +334,8 @@ def build_digest(
                 parts.append("Inga händelser.")
             else:
                 for person_name in sorted(persons_events.keys()):
-                    event_strs = [_format_event_short(e, tz) for e in persons_events[person_name]]
+                    deduped = _dedupe_events_same_day(persons_events[person_name], tz)
+                    event_strs = [_format_event_short(e, tz) for e in deduped]
                     parts.append(f"**{person_name}:** " + ". ".join(event_strs))
             parts.append("")
     elif events_by_person:
