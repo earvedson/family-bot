@@ -186,32 +186,40 @@ def format_notification(
     school_updates: dict[str, list[str]] | None = None,
 ) -> str:
     """Build a short Discord message for the diff. school_updates: optional per-person new highlight lines."""
-    parts = [f"**Vecka {target_week} ({iso_year}) – uppdateringar**"]
+    parts = [f"**Vecka {target_week} ({iso_year}) – uppdateringar**", ""]
     if school_changed:
-        if school_updates:
-            line_parts = []
-            for p in school_changed:
-                new_lines = school_updates.get(p)
-                if new_lines:
-                    line_parts.append(p + " – " + " ".join(new_lines))
-                else:
-                    line_parts.append(p + " (sida ändrad)")
-            parts.append("Skola: " + ". ".join(line_parts))
-        else:
-            parts.append("Skola: " + ", ".join(school_changed) + " (sida ändrad).")
+        parts.append("## Skola")
+        parts.append("")
+        for p in school_changed:
+            new_lines = school_updates.get(p) if school_updates else None
+            if new_lines:
+                parts.append(f"**{p}:**")
+                for line in new_lines:
+                    parts.append(line)
+                parts.append("")
+            else:
+                parts.append(f"**{p}:** (sida ändrad)")
+                parts.append("")
     if new_events:
-        lines = []
-        for e in new_events[:15]:
+        parts.append("## Kalender")
+        parts.append("")
+        shown = new_events[:15]
+        by_person: dict[str, list[dict]] = {}
+        for e in shown:
             person = e.get("person", "?")
-            start = e.get("start", "")
-            summary = e.get("summary", "")
-            try:
-                dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                time_str = dt.strftime("%a %H:%M")
-            except Exception:
-                time_str = start[:16] if len(start) >= 16 else start
-            lines.append(f"{person} – {time_str} {summary}")
+            by_person.setdefault(person, []).append(e)
+        for person in by_person:
+            parts.append(f"**{person}:**")
+            for e in by_person[person]:
+                start = e.get("start", "")
+                summary = e.get("summary", "")
+                try:
+                    dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%a %d/%m %H:%M")
+                except Exception:
+                    time_str = start[:16] if len(start) >= 16 else start
+                parts.append(f"• {time_str} – {summary}")
+            parts.append("")
         if len(new_events) > 15:
-            lines.append(f"... och {len(new_events) - 15} till.")
-        parts.append("Kalender: " + " | ".join(lines))
+            parts.append(f"... och {len(new_events) - 15} till.")
     return "\n".join(parts)
