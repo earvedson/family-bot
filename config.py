@@ -62,15 +62,11 @@ ICS_URLS = [u.strip() for u in _ics.split(",") if u.strip()]
 # Discord webhook URL (required for sending)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-# Use LLM to extract school highlights from raw page text (OPENAI_API_KEY required).
-# When True, rule-based filtering in school.py is skipped; the LLM does week filtering and relevance.
-USE_LLM_EXTRACTION = os.environ.get("USE_LLM_EXTRACTION", "").strip().lower() in ("1", "true", "yes")
-
 # Timezone for calendar week and event display (e.g. Europe/Stockholm). Used for target-week range and day labels.
 CALENDAR_TIMEZONE = os.environ.get("CALENDAR_TIMEZONE", "Europe/Stockholm").strip() or "Europe/Stockholm"
 
-# OpenAI model for digest (create_weekly_overview) and school extraction. Must be a Chat Completions model ID.
-OPENAI_DIGEST_MODEL = (os.environ.get("OPENAI_DIGEST_MODEL") or "gpt-4o-mini").strip()
+# Claude model for digest writing (create_weekly_overview). Must be a Messages API model ID.
+ANTHROPIC_DIGEST_MODEL = (os.environ.get("ANTHROPIC_DIGEST_MODEL") or "claude-sonnet-5").strip()
 
 # Directory for week snapshots (Sunday capture; weekday diff). Default: .digest_snapshots
 DIGEST_SNAPSHOT_DIR = (
@@ -79,12 +75,32 @@ DIGEST_SNAPSHOT_DIR = (
 )
 
 
+def _person_env_key(prefix: str, person_name: str) -> str:
+    return prefix + re.sub(r"[^A-Za-z0-9]+", "_", person_name).upper().strip("_")
+
+
 def get_special_info(person_name: str) -> str | None:
     """
-    Return optional per-person special info (e.g. subject swaps) from env.
+    Return optional per-person special info (e.g. subject swaps) from env. Purely a human-readable
+    note shown in the digest - it does not affect what's extracted; see get_suppressed_subjects
+    for actually filtering a subject out.
     Key: SPECIAL_INFO_<NAME> with name uppercased and non-alphanumeric chars replaced by underscore.
     Person name must match the name used in PERSON_SCHOOL.
     """
-    key = "SPECIAL_INFO_" + re.sub(r"[^A-Za-z0-9]+", "_", person_name).upper().strip("_")
-    value = (os.environ.get(key) or "").strip()
+    value = (os.environ.get(_person_env_key("SPECIAL_INFO_", person_name)) or "").strip()
     return value if value else None
+
+
+def get_suppressed_subjects(person_name: str) -> set[str]:
+    """
+    Return the set of subject names (normalized: stripped, casefolded) to leave out of this
+    person's Skola highlights entirely - e.g. a subject they don't take. Matched case-insensitively
+    against the Veckoplanering "Ämne" column, so it doesn't need to match the site's exact casing.
+    Key: SUPPRESS_SUBJECTS_<NAME> (same NAME normalization as SPECIAL_INFO_<NAME>),
+    comma-separated subject names. Combine with SPECIAL_INFO_<NAME> for a human-readable note
+    explaining why (e.g. "Franska, Tyska (har Spanska istället)").
+    """
+    value = (os.environ.get(_person_env_key("SUPPRESS_SUBJECTS_", person_name)) or "").strip()
+    if not value:
+        return set()
+    return {s.strip().casefold() for s in value.split(",") if s.strip()}

@@ -1,272 +1,449 @@
-"""Fetch and parse school class pages for weekly highlights."""
+"""
+Fetch and parse school class pages for weekly highlights.
+
+The class landing page (Google Sites) is just a directory: it links out to two Google Docs that
+hold the actual content, both exported as HTML tables (works anonymously for public docs):
+
+- "Provschema": a term-long test schedule shared across a whole "lag" (e.g. 6B/7B/8B/9B all read
+  the same doc). One table per ISO week: weekday rows x class-label columns.
+- "Veckoplanering <class>": the class-specific weekly plan, one doc reused every week. One block
+  per week: an "Aktuell information" note + a subject table (Ämne | Veckans planering | Övrigt/Läxor).
+
+Both docs are teacher-edited and error prone (typos, forgotten renumbering, copy-paste). The
+parser is tolerant of that (see parse_veckoplanering) but never silently shows a different week's
+content under the target week's heading — see SchoolInfo.status.
+"""
 
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 import config
 
-# Subject headers we split on (order matters for splitting)
-SUBJECT_HEADERS = [
-    "Svenska",
-    "Matematik",
-    "Engelska",
-    "NO",
-    "SO",
-    "Idrott och hälsa",
-    "Musik",
-    "Bild",
-    "Slöjd",
-    "Franska",
-    "Spanska",
-    "Tyska",
-    "Español",
-]
+# How many weeks beyond target_week to look ahead in Provschema for SchoolInfo.upcoming_tests.
+UPCOMING_TEST_WEEKS_AHEAD = 2
 
-# Keywords that mark important items (prov, läxa, förhör, etc.)
-IMPORTANT_KEYWORDS = re.compile(
-    r"\b(prov|läxa|förhör|diagnos|inlämning|deadline|tenta|hemuppgift)\b",
-    re.IGNORECASE,
-)
-# Week reference: v. 6, v.7, V.8, vecka 6, Week 8 (English)
-WEEK_REF = re.compile(
-    r"\b(?:[vV]\.?\s*\d+|vecka\s*\d+|week\s*\d+)",
-    re.IGNORECASE,
-)
-# Week range: v7-11, v.3 - 6, Week 3 - 8
-WEEK_RANGE = re.compile(r"(\d+)\s*-\s*(\d+)")
-# Extract week number from a week ref (e.g. "v. 6" -> 6)
-WEEK_NUM = re.compile(r"\d+")
+_WEEKDAYS_SV = ("Måndag", "Tisdag", "Onsdag", "Torsdag", "Fredag")
 
-# Lines with no week ref that are too generic (likely from past-week blocks) – skip
-GENERIC_NO_WEEK_PHRASES = frozenset(
-    s.strip().lower()
-    for s in (
-        "Prov",
-        "Prov.",
-        "Ingen läxa",
-        "Ingen läxa.",
-    )
-)
-# Start of line that is generic Classroom promo (not week-specific)
-CLASSROOM_PROMO_PATTERN = re.compile(
-    r"^[\s\-]*här finns planering för (kapitlet|kapitel)",
+_LINK_HREF_RE = re.compile(
+    r"docs\.google\.com/document/|drive\.google\.com/open|docs\.google\.com/spreadsheets/",
     re.IGNORECASE,
 )
-# Short week-range line (e.g. "Week 3 - 8") where we want to pull in the next line as context
-WEEK_RANGE_ONLY_LINE = re.compile(
-    r"^(Week\s+\d+\s*-\s*\d+|v\d+\s*-\s*\d+)\s*$",
-    re.IGNORECASE,
-)
-MAX_FOLLOW_LINE_LEN = 220  # cap context for Engelska follow-line(s)
-MAX_FOLLOW_LINES = 5  # max lines of context after week-range line (then truncate)
+_DOC_ID_RE = re.compile(r"/document/d/([\w-]+)")
+_OPEN_ID_RE = re.compile(r"[?&]id=([\w-]+)")
+_VECKA_RE = re.compile(r"^vecka:?\s*(\S+)", re.IGNORECASE)
+_PROVSCHEMA_WEEK_RE = re.compile(r"vecka\s*(\d+)", re.IGNORECASE)
+_INFO_PREFIX_RE = re.compile(r"^aktuell information:?\s*", re.IGNORECASE)
+_HEADER_KEYWORDS = ("ämne", "veckans planering", "övrigt")
+# Fallback for an un-hyperlinked Classroom join code left as plain text after the subject name
+# (e.g. "NO 6ehmkgbq") - lowercase alnum, 4-12 chars, containing at least one digit.
+_TRAILING_CLASSROOM_CODE_RE = re.compile(r"\s+(?=[a-z0-9]*\d)[a-z0-9]{4,12}$")
 
 
 @dataclass
 class SchoolInfo:
-    """Parsed school page info for one person's class."""
+    """Parsed school info for one person's class, for a target week."""
 
     person_name: str
-    class_label: Optional[str]  # e.g. 6B; shown as "Name (6B)" in digest when set
+    class_label: Optional[str]  # e.g. "7B"; also selects the Provschema column
     url: str
+    week: Optional[int]  # week actually matched in Veckoplanering (None if not found)
+    highlights: list[str]  # "**Ämne:** ..." / "**Ämne (läxa):** ..." lines (no tests - see below)
+    tests: list[tuple[str, str]] = field(default_factory=list)  # (weekday, description) for target_week
+    upcoming_tests: list[tuple[int, str, str]] = field(default_factory=list)  # (week, weekday, desc)
+    info_note: Optional[str] = None  # "Aktuell information" free text
+    status: str = "ok"  # "ok" | "week_not_published" | "fetch_error"
+    latest_week_available: Optional[int] = None  # set when status == "week_not_published"
+    warnings: list[str] = field(default_factory=list)  # soft issues; info still (partially) shown
+    error: Optional[str] = None  # hard failure; nothing could be fetched
+
+
+@dataclass
+class _DiscoveredLinks:
+    provschema_id: Optional[str]
+    veckoplanering_id: Optional[str]
+    unclassified_labels: list[str]
+
+
+@dataclass
+class _WeekBlock:
     week: Optional[int]
-    highlights: list[str]
-    error: Optional[str] = None
+    raw_token: str
+    info: str
+    subjects: dict[str, dict[str, str]]  # subject -> {"plan": ..., "homework": ...}
+    nonempty_cells: int
 
 
-def _get_page_text(url: str, timeout: float = 15.0) -> str:
-    """Fetch URL and return main text content. Strikethrough content is removed."""
-    resp = httpx.get(url, follow_redirects=True, timeout=timeout)
+# ---------------------------------------------------------------------------
+# Google Doc URL / HTML helpers
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_google_redirect(href: str) -> str:
+    """Google Docs wraps outbound links as https://www.google.com/url?q=<real>&... - unwrap that."""
+    try:
+        parsed = urlparse(href)
+        if parsed.netloc.endswith("google.com") and parsed.path == "/url":
+            qs = parse_qs(parsed.query)
+            if qs.get("q"):
+                return qs["q"][0]
+    except Exception:
+        pass
+    return href
+
+
+def _google_doc_id(href: str) -> Optional[str]:
+    href = _unwrap_google_redirect(href)
+    m = _DOC_ID_RE.search(href)
+    if m:
+        return m.group(1)
+    m = _OPEN_ID_RE.search(href)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _link_label(a_tag) -> str:
+    """Visible label for a link: its own text, or the nearest non-empty ancestor's text.
+
+    Google Sites often renders these as button components where the <a> itself has no text and
+    the label lives on a parent <div> (verified on the real page).
+    """
+    text = a_tag.get_text(" ", strip=True)
+    if text:
+        return text
+    node = a_tag
+    for _ in range(4):
+        node = node.parent
+        if node is None:
+            break
+        text = node.get_text(" ", strip=True)
+        if text and len(text) < 150:
+            return text
+    return ""
+
+
+def _classify_link_label(label: str) -> Optional[str]:
+    low = label.lower()
+    if "prov" in low:
+        return "provschema"
+    if "veckoplanering" in low or "planering" in low:
+        return "veckoplanering"
+    return None
+
+
+def _discover_source_links(landing_url: str, timeout: float = 15.0) -> _DiscoveredLinks:
+    """Fetch the class landing page and find the Provschema / Veckoplanering doc links."""
+    resp = httpx.get(landing_url, follow_redirects=True, timeout=timeout)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    # Remove strikethrough (old/deprecated) so it doesn't appear in highlights
-    for tag in soup.find_all(["s", "strike", "del"]):
-        tag.decompose()
-    for tag in soup.find_all(
-        lambda t: t.get("style") and "line-through" in (t.get("style") or "").lower()
-    ):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
+    provschema_id: Optional[str] = None
+    veckoplanering_id: Optional[str] = None
+    unclassified: list[str] = []
+    seen_hrefs: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not _LINK_HREF_RE.search(href) or href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+        doc_id = _google_doc_id(href)
+        if not doc_id:
+            continue
+        label = _link_label(a)
+        kind = _classify_link_label(label)
+        if kind == "provschema" and provschema_id is None:
+            provschema_id = doc_id
+        elif kind == "veckoplanering" and veckoplanering_id is None:
+            veckoplanering_id = doc_id
+        elif kind is None:
+            unclassified.append(label or href)
+    return _DiscoveredLinks(provschema_id, veckoplanering_id, unclassified)
 
 
-def _extract_week(text: str) -> Optional[int]:
-    """Extract current week number from text (e.g. 'Vecka 6' or 'Vecka6')."""
-    m = re.search(r"Vecka\s*(\d+)", text, re.IGNORECASE)
-    return int(m.group(1)) if m else None
+def _fetch_doc_html(doc_id: str, cache: dict[str, str], timeout: float = 20.0) -> str:
+    """Fetch a Google Doc's HTML export, memoized by doc_id (docs are shared across siblings)."""
+    if doc_id in cache:
+        return cache[doc_id]
+    url = f"https://docs.google.com/document/d/{doc_id}/export?format=html"
+    resp = httpx.get(url, follow_redirects=True, timeout=timeout)
+    resp.raise_for_status()
+    cache[doc_id] = resp.text
+    return resp.text
 
 
-def _relevant_line(line: str) -> bool:
-    """True if line contains something we want in the digest (prov, läxa, förhör, week ref)."""
-    line = line.strip()
-    if not line or len(line) > 500:
-        return False
-    return bool(IMPORTANT_KEYWORDS.search(line) or WEEK_REF.search(line))
+# ---------------------------------------------------------------------------
+# Rich-text cell extraction
+# ---------------------------------------------------------------------------
 
 
-def _all_week_numbers_in_line(line: str) -> list[int]:
-    """Extract all week numbers mentioned in a line (refs like v.6 and ranges like v7-11)."""
-    numbers: set[int] = set()
-    for m in WEEK_REF.finditer(line):
-        num_match = WEEK_NUM.search(m.group(0))
-        if num_match:
-            numbers.add(int(num_match.group(0)))
-    for m in WEEK_RANGE.finditer(line):
-        numbers.add(int(m.group(1)))
-        numbers.add(int(m.group(2)))
-    return sorted(numbers)
+def _rich_text(node, drop_classroom_links: bool) -> str:
+    """Render a node's text, turning <a href> into markdown links (or dropping Classroom links)."""
+    if isinstance(node, NavigableString):
+        return str(node)
+    if getattr(node, "name", None) == "br":
+        return " "  # a <br> inside one <p> separates lines that must not run together
+    if getattr(node, "name", None) == "a" and node.get("href"):
+        href = _unwrap_google_redirect(node["href"])
+        inner = "".join(_rich_text(c, drop_classroom_links) for c in node.children).strip()
+        if drop_classroom_links and "classroom.google.com" in href:
+            return ""
+        if not inner:
+            return ""
+        return f"[{inner}]({href})"
+    return "".join(_rich_text(c, drop_classroom_links) for c in getattr(node, "children", []))
 
 
-def _is_generic_no_week_line(line: str) -> bool:
-    """True if line has no week ref and is a known generic phrase we should skip."""
-    if _all_week_numbers_in_line(line):
-        return False  # Has week ref – keep/week filter decides
-    normalized = " ".join(line.strip().lower().split())
-    if normalized in GENERIC_NO_WEEK_PHRASES:
-        return True
-    if CLASSROOM_PROMO_PATTERN.search(line):
-        return True
-    return False
+def _cell_paragraph_texts(cell, drop_classroom_links: bool) -> list[str]:
+    paragraphs = cell.find_all("p") or [cell]
+    out = []
+    for p in paragraphs:
+        text = " ".join(_rich_text(p, drop_classroom_links).split())
+        if text:
+            out.append(text)
+    return out
 
 
-def _line_applies_to_week(line: str, target_week: int) -> bool:
+def _subject_name_from_cell(cell) -> str:
     """
-    True if this line should be kept for target_week (rule-based filter).
+    First paragraph of the Ämne/Classroom-kod cell, with any Classroom join-code dropped.
 
-    - "denna vecka" / "nästa vecka" -> keep.
-    - No week ref -> keep (ambiguous).
-    - If any week in [target_week-1, target_week+1] -> keep (e.g. Week 3-8, v7-11).
-    - If all mentioned weeks are strictly in the past (< target_week) -> drop.
-    - Otherwise -> drop (only future weeks).
+    Usually the code is hyperlinked to classroom.google.com, which _rich_text already strips.
+    But it isn't always - verified on a live page where the same site left one join code as
+    plain text next to the subject name (e.g. "NO 6ehmkgbq"). Fall back to stripping a trailing
+    lowercase-alnum token containing a digit (subject names here are capitalized Swedish words;
+    join codes are lowercase and, in every code observed so far, contain at least one digit).
     """
-    line_lower = line.lower()
-    if "denna vecka" in line_lower or "nästa vecka" in line_lower:
-        return True
-    weeks = _all_week_numbers_in_line(line)
-    if not weeks:
-        return True  # No week ref -> keep
-    in_window = any(w in (target_week - 1, target_week, target_week + 1) for w in weeks)
-    if in_window:
-        return True  # e.g. "Week 3 - 8" or "v7-11" for target 8
-    if all(w < target_week for w in weeks):
-        return False  # Only past weeks (e.g. V. 4 when target is 8)
-    return False  # Only future weeks
+    paras = _cell_paragraph_texts(cell, drop_classroom_links=True)
+    if not paras:
+        return ""
+    text = paras[0].strip().rstrip(":").strip()
+    text = _TRAILING_CLASSROOM_CODE_RE.sub("", text).strip()
+    return text
 
 
-def _filter_highlights_for_week(highlights: list[str], target_week: int) -> list[str]:
-    """Keep only highlights that apply to target_week (or target_week+1)."""
-    return [h for h in highlights if _line_applies_to_week(h, target_week)]
+def _cell_text(cell) -> str:
+    return " ".join(_cell_paragraph_texts(cell, drop_classroom_links=False))
 
 
-def _parse_page_text(text: str, url: str, person_name: str, class_label: Optional[str]) -> SchoolInfo:
-    """Parse full page text into structured highlights."""
-    week = _extract_week(text)
-    highlights: list[str] = []
+# ---------------------------------------------------------------------------
+# Veckoplanering parsing
+# ---------------------------------------------------------------------------
 
-    # Find all subject header positions (start index, header name).
-    # Use word boundary so "NO" doesn't match inside "diagnos".
-    positions: list[tuple[int, str]] = []
-    for header in SUBJECT_HEADERS:
-        pattern = re.compile(
-            r"\b" + re.escape(header) + r"\s*:?\s*",
-            re.IGNORECASE,
+
+def _looks_like_subject_header(row) -> bool:
+    cells = row.find_all(["td", "th"])
+    text = " ".join(c.get_text(" ", strip=True) for c in cells).lower()
+    return all(k in text for k in _HEADER_KEYWORDS)
+
+
+def _parse_info_table(table) -> str:
+    rows = table.find_all("tr")
+    if not rows:
+        return ""
+    cells = rows[0].find_all(["td", "th"])
+    if not cells:
+        return ""
+    return _INFO_PREFIX_RE.sub("", _cell_text(cells[0])).strip()
+
+
+def _parse_subject_table(table) -> tuple[dict[str, dict[str, str]], int]:
+    subjects: dict[str, dict[str, str]] = {}
+    nonempty = 0
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 3:
+            continue
+        subject = _subject_name_from_cell(cells[0])
+        if not subject:
+            continue
+        plan = _cell_text(cells[1])
+        homework = _cell_text(cells[2])
+        if plan:
+            nonempty += 1
+        if homework:
+            nonempty += 1
+        if not plan and not homework:
+            continue  # nothing to show for this subject this week
+        subjects[subject] = {"plan": plan, "homework": homework}
+    return subjects, nonempty
+
+
+def parse_veckoplanering(html: str) -> tuple[dict[int, _WeekBlock], list[str], Optional[_WeekBlock]]:
+    """
+    Parse a Veckoplanering doc export into week blocks.
+
+    Returns (blocks_by_week, warnings, fallback_block). fallback_block is set only when exactly
+    one block has real content but no valid week number (e.g. the MALL template was filled in but
+    never renumbered) - it's informational only (logged to stderr, not put in `warnings`, since on
+    the real document this is steady-state teacher scaffolding, not a per-run anomaly) and never
+    used as a substitute for a missing target week: on the real page this template turned out to
+    hold stale leftovers from a previous week, not pre-filled upcoming content, so treating it as
+    "close enough" would misinform rather than help.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    body = soup.body or soup
+
+    blocks: dict[int, _WeekBlock] = {}
+    unlabeled_filled: list[_WeekBlock] = []
+    warnings: list[str] = []
+
+    pending_token: Optional[str] = None
+    pending_week: Optional[int] = None
+    stage: Optional[str] = None  # "await_info" | "await_subjects" | None
+    current_info = ""
+
+    for child in body.children:
+        name = getattr(child, "name", None)
+        if name is None:
+            continue
+        if name == "p":
+            m = _VECKA_RE.match(child.get_text(" ", strip=True))
+            if m:
+                pending_token = m.group(1)
+                pending_week = int(pending_token) if pending_token.isdigit() else None
+                current_info = ""
+                stage = "await_info"
+            continue
+        if name != "table" or stage is None:
+            continue
+        rows = child.find_all("tr")
+        if not rows:
+            continue
+        if stage == "await_info":
+            if len(rows) == 1:
+                current_info = _parse_info_table(child)
+                stage = "await_subjects"
+                continue
+            stage = "await_subjects"  # no dedicated info table; treat this as the subject table
+        if not _looks_like_subject_header(rows[0]):
+            warnings.append(
+                "Kunde inte tolka en veckotabell i veckoplaneringen "
+                "(kolumnrubrikerna matchade inte förväntat format)."
+            )
+            stage = None
+            continue
+        subjects, nonempty = _parse_subject_table(child)
+        block = _WeekBlock(
+            week=pending_week,
+            raw_token=pending_token or "",
+            info=current_info,
+            subjects=subjects,
+            nonempty_cells=nonempty,
         )
-        for m in pattern.finditer(text):
-            positions.append((m.start(), header))
-            break  # first occurrence per header
-    positions.sort(key=lambda x: x[0])
+        if pending_week is None:
+            if nonempty > 0:
+                unlabeled_filled.append(block)
+        elif pending_week in blocks:
+            existing = blocks[pending_week]
+            if block.nonempty_cells > existing.nonempty_cells:
+                warnings.append(
+                    f"Flera block för vecka {pending_week} hittades i veckoplaneringen; "
+                    "använder det med mest innehåll."
+                )
+                blocks[pending_week] = block
+            else:
+                warnings.append(
+                    f"Flera block för vecka {pending_week} hittades i veckoplaneringen; "
+                    "ignorerar ett block utan mer innehåll."
+                )
+        else:
+            blocks[pending_week] = block
+        stage = None
 
-    for i, (start, header) in enumerate(positions):
-        end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
-        segment = text[start:end]
-        lines = segment.splitlines()
-        skip_count = 0
-        for idx, raw_line in enumerate(lines):
-            if skip_count > 0:
-                skip_count -= 1
-                continue
-            line = raw_line.strip().lstrip(":")
-            if not line or line.lower().startswith(header.lower()):
-                continue
-            line = " ".join(line.split())
-            if _is_generic_no_week_line(line):
-                continue
-            if _relevant_line(line):
-                # For Engelska: if this is a short week-range line, add next line as context
-                if (
-                    header == "Engelska"
-                    and WEEK_RANGE_ONLY_LINE.match(line)
-                    and idx + 1 < len(lines)
-                ):
-                    # Use raw segment text after this line (robust to HTML line breaks)
-                    line_start = segment.find(line) if line in segment else segment.find(raw_line.strip())
-                    if line_start == -1:
-                        line_start = 0
-                    rest = segment[line_start + len(line):].strip()
-                    # Cut at next section (line that starts with NO:, Classroom:, or subject)
-                    take = []
-                    for ln in rest.split("\n"):
-                        ln = ln.strip()
-                        if not ln:
-                            continue
-                        if ln.lower().startswith("classroom:") or any(
-                            ln.lower().startswith(h.lower() + ":") or ln.lower().startswith(h.lower() + " ")
-                            for h in SUBJECT_HEADERS
-                        ):
-                            break
-                        take.append(ln)
-                    rest = " ".join(take)
-                    if rest and len(rest) > 10:
-                        if len(rest) > MAX_FOLLOW_LINE_LEN:
-                            rest = rest[: MAX_FOLLOW_LINE_LEN - 3].rstrip() + "..."
-                        highlights.append(f"**{header}:** {line}. {rest}")
-                        skip_count = sum(1 for j in range(idx + 1, len(lines)) if lines[j].strip())
-                        continue
-                    # Fallback: collect by lines
-                    follow_parts = []
-                    for j in range(idx + 1, len(lines)):
-                        part = " ".join(lines[j].strip().split())
-                        if not part:
-                            continue
-                        if part.lower().startswith("classroom:") or any(
-                            part.lower().startswith(h.lower() + ":")
-                            for h in SUBJECT_HEADERS
-                        ):
-                            break
-                        follow_parts.append(part)
-                    follow = " ".join(follow_parts)
-                    if follow and len(follow) > 10:
-                        if len(follow) > MAX_FOLLOW_LINE_LEN:
-                            follow = follow[: MAX_FOLLOW_LINE_LEN - 3].rstrip() + "..."
-                        highlights.append(f"**{header}:** {line}. {follow}")
-                        skip_count = len(follow_parts)
-                        continue
-                highlights.append(f"**{header}:** {line}")
-            elif header in ("Idrott och hälsa", "Musik", "Bild") and (
-                "ta med" in line.lower() or "dusch" in line.lower() or "ombyte" in line.lower()
-            ):
-                highlights.append(f"**{header}:** {line}")
+    # Note: an unlabeled-but-filled block (typically "MALL" used as reusable scaffolding) is
+    # steady-state on the real document, not a per-run anomaly - the teacher keeps stale leftover
+    # content in the template between rewrites. Log it for the maintainer rather than surfacing it
+    # in every digest the family gets, where a permanent technical parenthetical would just teach
+    # readers to ignore the warnings line (including the ones that are actually actionable).
+    fallback_block: Optional[_WeekBlock] = None
+    if len(unlabeled_filled) == 1:
+        fallback_block = unlabeled_filled[0]
+        print(
+            f"[school] Veckoplanering: block märkt “{fallback_block.raw_token}” (inte ett "
+            "veckonummer) innehåller planeringsinnehåll - kontrollera att sidan uppdaterats korrekt.",
+            file=sys.stderr,
+        )
+    elif len(unlabeled_filled) > 1:
+        print(
+            f"[school] Veckoplanering: {len(unlabeled_filled)} block utan giltigt veckonummer "
+            "innehåller innehåll och kunde inte tilldelas en vecka.",
+            file=sys.stderr,
+        )
 
-    # Deduplicate: normalize whitespace so "Prov  ->" and "Prov ->" merge
-    seen: set[str] = set()
-    unique: list[str] = []
-    for h in highlights:
-        normalized = " ".join(h.split())
-        if normalized not in seen:
-            seen.add(normalized)
-            unique.append(h)
+    return blocks, warnings, fallback_block
 
-    return SchoolInfo(
-        person_name=person_name,
-        class_label=class_label,
-        url=url,
-        week=week,
-        highlights=unique,
-    )
+
+# ---------------------------------------------------------------------------
+# Provschema parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_provschema(html: str) -> tuple[dict[int, dict[str, dict[str, str]]], set[str]]:
+    """
+    Parse a Provschema doc export.
+
+    Returns (weeks, class_labels): weeks maps {week: {weekday: {class_label: text}}} (only weeks
+    and cells with actual content); class_labels is every column header seen across the doc's
+    tables - a *complete* list of valid classes, unlike inspecting `weeks`, which only contains
+    classes that happen to have a test scheduled somewhere (validating a class_label against
+    `weeks` alone would misreport it as "not found" in a term with no tests yet for that class).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    result: dict[int, dict[str, dict[str, str]]] = {}
+    class_labels: set[str] = set()
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header_cells = rows[0].find_all(["td", "th"])
+        if not header_cells:
+            continue
+        m = _PROVSCHEMA_WEEK_RE.search(header_cells[0].get_text(" ", strip=True))
+        if not m:
+            continue
+        week = int(m.group(1))
+        row_class_labels = [c.get_text(" ", strip=True).strip().upper() for c in header_cells[1:]]
+        class_labels.update(c for c in row_class_labels if c)
+        by_weekday: dict[str, dict[str, str]] = {}
+        for row in rows[1:]:
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+            weekday = cells[0].get_text(" ", strip=True).strip()
+            by_class = {
+                label: text
+                for label, cell in zip(row_class_labels, cells[1:])
+                if (text := cell.get_text(" ", strip=True).strip())
+            }
+            if by_class:
+                by_weekday[weekday] = by_class
+        if by_weekday:
+            result[week] = by_weekday
+    return result, class_labels
+
+
+def _collect_tests_for_week(
+    provschema_weeks: dict[int, dict[str, dict[str, str]]],
+    week: int,
+    class_label_norm: str,
+) -> list[tuple[str, str]]:
+    by_weekday = provschema_weeks.get(week) or {}
+    out = []
+    for weekday in _WEEKDAYS_SV:
+        text = (by_weekday.get(weekday) or {}).get(class_label_norm)
+        if text:
+            out.append((weekday, text))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
 
 def fetch_school_info_for_person(
@@ -274,21 +451,14 @@ def fetch_school_info_for_person(
     class_label: Optional[str],
     url: str,
     target_week: Optional[int] = None,
+    _doc_cache: Optional[dict[str, str]] = None,
 ) -> SchoolInfo:
-    """Fetch and parse one school class page for a person."""
+    """Fetch and parse one person's school info for target_week."""
+    if _doc_cache is None:
+        _doc_cache = {}
+
     try:
-        text = _get_page_text(url)
-        info = _parse_page_text(text, url, person_name, class_label)
-        if target_week is not None and info.highlights:
-            info = SchoolInfo(
-                person_name=info.person_name,
-                class_label=info.class_label,
-                url=info.url,
-                week=info.week,
-                highlights=_filter_highlights_for_week(info.highlights, target_week),
-                error=info.error,
-            )
-        return info
+        links = _discover_source_links(url)
     except Exception as e:
         return SchoolInfo(
             person_name=person_name,
@@ -296,19 +466,96 @@ def fetch_school_info_for_person(
             url=url,
             week=None,
             highlights=[],
-            error=str(e),
+            status="fetch_error",
+            error=f"Kunde inte hämta sidan – {e}",
         )
+
+    warnings: list[str] = []
+    if links.unclassified_labels:
+        shown = ", ".join(links.unclassified_labels[:3])
+        warnings.append(f"Kunde inte känna igen {len(links.unclassified_labels)} länk(ar) på sidan: {shown}")
+
+    highlights: list[str] = []
+    info_note: Optional[str] = None
+    status = "ok"
+    latest_week_available: Optional[int] = None
+    week_matched: Optional[int] = None
+
+    if links.veckoplanering_id is None:
+        warnings.append("Hittade ingen länk till veckoplanering på sidan.")
+    else:
+        blocks: dict[int, _WeekBlock] = {}
+        try:
+            html = _fetch_doc_html(links.veckoplanering_id, _doc_cache)
+            blocks, vp_warnings, _fallback_block = parse_veckoplanering(html)
+            warnings.extend(vp_warnings)
+        except Exception as e:
+            warnings.append(f"Kunde inte läsa veckoplaneringen – {e}")
+        if target_week is not None:
+            block = blocks.get(target_week)
+            if block is not None:
+                week_matched = target_week
+                info_note = block.info or None
+                suppressed = config.get_suppressed_subjects(person_name)
+                for subject, cell in block.subjects.items():
+                    if subject.strip().casefold() in suppressed:
+                        continue
+                    if cell.get("plan"):
+                        highlights.append(f"**{subject}:** {cell['plan']}")
+                    if cell.get("homework"):
+                        highlights.append(f"**{subject} (läxa):** {cell['homework']}")
+            else:
+                # Don't fall back to the unlabeled/MALL block's content here: it's observed to
+                # hold stale leftovers from a previous week (not pre-filled next-week content),
+                # so showing it under target_week's heading would misinform, not help. The
+                # doc-level warning about it (added in parse_veckoplanering) is enough of a nudge
+                # to go check the page directly.
+                status = "week_not_published"
+                if blocks:
+                    latest_week_available = max(blocks.keys())
+
+    tests: list[tuple[str, str]] = []
+    upcoming_tests: list[tuple[int, str, str]] = []
+    if links.provschema_id is None:
+        warnings.append("Hittade ingen länk till provschema på sidan.")
+    elif not class_label:
+        warnings.append("Ingen klass angiven för denna person – kan inte slå upp provschema.")
+    else:
+        provschema_weeks: dict[int, dict[str, dict[str, str]]] = {}
+        known_classes: set[str] = set()
+        try:
+            html = _fetch_doc_html(links.provschema_id, _doc_cache)
+            provschema_weeks, known_classes = parse_provschema(html)
+        except Exception as e:
+            warnings.append(f"Kunde inte läsa provschemat – {e}")
+        class_norm = class_label.strip().upper()
+        if known_classes and class_norm not in known_classes:
+            warnings.append(
+                f"Klass '{class_label}' hittades inte i provschemat; kolumner: " + ", ".join(sorted(known_classes))
+            )
+        elif target_week is not None:
+            tests = _collect_tests_for_week(provschema_weeks, target_week, class_norm)
+            for w in range(target_week + 1, target_week + 1 + UPCOMING_TEST_WEEKS_AHEAD):
+                for weekday, desc in _collect_tests_for_week(provschema_weeks, w, class_norm):
+                    upcoming_tests.append((w, weekday, desc))
+
+    return SchoolInfo(
+        person_name=person_name,
+        class_label=class_label,
+        url=url,
+        week=week_matched,
+        highlights=highlights,
+        tests=tests,
+        upcoming_tests=upcoming_tests,
+        info_note=info_note,
+        status=status,
+        latest_week_available=latest_week_available,
+        warnings=warnings,
+    )
 
 
 def fetch_all_school_info(target_week: Optional[int] = None) -> list[SchoolInfo]:
-    """
-    Fetch and parse all configured person school pages (from PERSON_SCHOOL).
-
-    If target_week is set (e.g. next week's ISO week), highlights are filtered
-    to lines that mention that week or target_week+1, or "denna/nästa vecka",
-    or have no week reference. Use with LLM improvement for best results on
-    unstructured teacher text.
-    """
+    """Fetch and parse all configured person school pages (from PERSON_SCHOOL)."""
     if not config.PERSON_SCHOOL:
         return [
             SchoolInfo(
@@ -317,33 +564,12 @@ def fetch_all_school_info(target_week: Optional[int] = None) -> list[SchoolInfo]
                 url="",
                 week=None,
                 highlights=[],
+                status="fetch_error",
                 error="PERSON_SCHOOL not set in .env (format: Name|ClassLabel|URL,...)",
             )
         ]
+    doc_cache: dict[str, str] = {}  # shared across siblings so a shared Provschema is fetched once
     return [
-        fetch_school_info_for_person(person_name, class_label, url, target_week=target_week)
+        fetch_school_info_for_person(person_name, class_label, url, target_week=target_week, _doc_cache=doc_cache)
         for person_name, class_label, url in config.PERSON_SCHOOL
     ]
-
-
-def get_raw_page_text(url: str, timeout: float = 15.0) -> str:
-    """Fetch URL and return full page text (strikethrough removed). For LLM extraction."""
-    return _get_page_text(url, timeout=timeout)
-
-
-def fetch_all_raw_school_texts() -> list[tuple[str, Optional[str], str, Optional[str], Optional[str]]]:
-    """
-    Fetch raw page text for all configured school pages.
-    Returns list of (person_name, class_label, url, raw_text, error).
-    raw_text is None if fetch failed (error set).
-    """
-    if not config.PERSON_SCHOOL:
-        return []
-    out: list[tuple[str, Optional[str], str, Optional[str], Optional[str]]] = []
-    for person_name, class_label, url in config.PERSON_SCHOOL:
-        try:
-            text = _get_page_text(url)
-            out.append((person_name, class_label, url, text, None))
-        except Exception as e:
-            out.append((person_name, class_label, url, None, str(e)))
-    return out

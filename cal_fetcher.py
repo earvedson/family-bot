@@ -20,6 +20,7 @@ class CalendarEvent:
     start: datetime
     end: Optional[datetime]
     location: Optional[str] = None
+    all_day: bool = False
 
 
 def _to_datetime(val) -> Optional[datetime]:
@@ -35,14 +36,24 @@ def _to_datetime(val) -> Optional[datetime]:
     return None
 
 
-def _parse_dt(component, key: str) -> Optional[datetime]:
-    """Get a datetime from an icalendar component (DTSTART/DTEND)."""
+def _parse_dt(component, key: str) -> tuple[Optional[datetime], bool]:
+    """
+    Get (datetime, is_all_day) from an icalendar component (DTSTART/DTEND).
+
+    An all-day event's ICS value is a plain DATE (no time/timezone) - is_all_day is set from
+    that, not inferred later from the resulting datetime's hour. A DATE stored as midnight UTC
+    (see _to_datetime) is NOT midnight in CALENDAR_TIMEZONE for any timezone ahead of UTC, so a
+    "was it exactly midnight after tz conversion" check would misdetect every all-day event as
+    timed (e.g. showing "02:00" for an all-day item in Europe/Stockholm during summer).
+    """
     val = component.get(key)
     if val is None:
-        return None
+        return None, False
     if isinstance(val, icalendar.vDDDTypes):
-        return _to_datetime(val.dt)
-    return None
+        raw = val.dt
+        is_all_day = isinstance(raw, date) and not isinstance(raw, datetime)
+        return _to_datetime(raw), is_all_day
+    return None, False
 
 
 def _get_events_from_ics(ics_text: str) -> list[CalendarEvent]:
@@ -53,14 +64,14 @@ def _get_events_from_ics(ics_text: str) -> list[CalendarEvent]:
         if component.name != "VEVENT":
             continue
         summary = str(component.get("SUMMARY", ""))
-        start = _parse_dt(component, "DTSTART")
+        start, all_day = _parse_dt(component, "DTSTART")
         if start is None:
             continue
-        end = _parse_dt(component, "DTEND")
+        end, _ = _parse_dt(component, "DTEND")
         location = component.get("LOCATION")
         location = str(location) if location else None
         events.append(
-            CalendarEvent(summary=summary, start=start, end=end, location=location)
+            CalendarEvent(summary=summary, start=start, end=end, location=location, all_day=all_day)
         )
     return events
 
@@ -86,15 +97,15 @@ def _get_events_from_ics_between(
         for component in recurring_ical_events.of(cal, skip_bad_series=True).between(
             from_date, end_date
         ):
-            start = _parse_dt(component, "DTSTART")
+            start, all_day = _parse_dt(component, "DTSTART")
             if start is None:
                 continue
             summary = str(component.get("SUMMARY", ""))
-            end = _parse_dt(component, "DTEND")
+            end, _ = _parse_dt(component, "DTEND")
             location = component.get("LOCATION")
             location = str(location) if location else None
             events.append(
-                CalendarEvent(summary=summary, start=start, end=end, location=location)
+                CalendarEvent(summary=summary, start=start, end=end, location=location, all_day=all_day)
             )
     except Exception:
         raw = _get_events_from_ics(ics_text)

@@ -8,7 +8,7 @@ Run once per week via cron, e.g.:
 
 Without --week: the digest targets the *current* week when run Monday–Friday,
 and *next* week when run Saturday or Sunday.
-If OPENAI_API_KEY is set, school and calendar data are sent to the LLM, which
+If ANTHROPIC_API_KEY is set, school and calendar data are sent to Claude, which
 produces the full weekly overview. Otherwise the digest is built from templates (build_digest).
 
 Capture mode (for reviewing and improving filtering):
@@ -30,16 +30,11 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import config
-from school import fetch_all_school_info, fetch_all_raw_school_texts
+from school import fetch_all_school_info
 from cal_fetcher import fetch_events_for_week
 from digest import build_digest
 from discord_notify import send_digest
-from llm_improve import (
-    create_weekly_overview,
-    create_weekly_overview_from_raw,
-    get_new_school_items_only,
-    _raw_blocks_to_school_infos,
-)
+from llm_improve import create_weekly_overview
 from snapshot import (
     build_snapshot,
     diff_snapshots,
@@ -121,28 +116,13 @@ def main() -> int:
         iso_year, target_week, _ = today.isocalendar()
         monday_of_week = date.fromisocalendar(iso_year, target_week, 1)
         reference_date = monday_of_week - timedelta(days=7)
-        if config.USE_LLM_EXTRACTION:
-            raw_blocks = [
-                (pn, cl, raw_text, err)
-                for pn, cl, _url, raw_text, err in fetch_all_raw_school_texts()
-            ]
-            school_infos = None
-        else:
-            school_infos = fetch_all_school_info(target_week=target_week)
-            raw_blocks = None
+        school_infos = fetch_all_school_info(target_week=target_week)
         try:
             events_by_person = fetch_events_for_week(target_week, reference_date=reference_date)
         except Exception as e:
             print(f"Calendar fetch failed: {e}", file=sys.stderr)
             events_by_person = []
-        current = build_snapshot(
-            school_infos,
-            raw_blocks,
-            events_by_person,
-            target_week,
-            iso_year,
-            config.USE_LLM_EXTRACTION,
-        )
+        current = build_snapshot(school_infos, events_by_person, target_week, iso_year)
         stored = load_snapshot(iso_year, target_week)
         if stored is None:
             print(f"No snapshot for week {target_week} ({iso_year}). Run full digest first (e.g. Sunday).", file=sys.stderr)
@@ -153,22 +133,18 @@ def main() -> int:
                 print("Dry-run: no changes; would not send.", file=sys.stderr)
             return 0
         school_updates: dict[str, list[str]] = {}
-        if school_changed:
-            if "school_highlights" in stored and "school_highlights" in current:
-                for p in school_changed:
-                    cur_set = set(current["school_highlights"].get(p) or [])
-                    stored_set = set(stored["school_highlights"].get(p) or [])
-                    new_lines = list(cur_set - stored_set)
-                    if new_lines:
-                        school_updates[p] = new_lines
-            elif "school_digest_highlights" in stored and raw_blocks is not None:
-                person_to_raw = {pn: (raw or "") for (pn, _, raw, _) in raw_blocks}
-                for p in school_changed:
-                    previous = stored["school_digest_highlights"].get(p) or []
-                    raw_text = person_to_raw.get(p) or ""
-                    new_lines = get_new_school_items_only(p, previous, raw_text, target_week)
-                    if new_lines:
-                        school_updates[p] = new_lines
+        for p in school_changed:
+            new_lines: list[str] = []
+            cur_h = set(current.get("school_highlights", {}).get(p) or [])
+            stored_h = set(stored.get("school_highlights", {}).get(p) or [])
+            new_lines.extend(sorted(cur_h - stored_h))
+            cur_t = set(current.get("school_tests", {}).get(p) or [])
+            stored_t = set(stored.get("school_tests", {}).get(p) or [])
+            for t in sorted(cur_t - stored_t):
+                weekday, _, desc = t.partition("|")
+                new_lines.append(f"**PROV** ({weekday}): {desc}")
+            if new_lines:
+                school_updates[p] = new_lines
         msg = format_notification(
             target_week, iso_year, school_changed, new_events, school_updates=school_updates or None
         )
@@ -182,11 +158,6 @@ def main() -> int:
             return 1
         try:
             send_digest(msg)
-            # Preserve school_digest_highlights so next run has updated "previous" baseline
-            if "school_digest_highlights" in stored:
-                current["school_digest_highlights"] = dict(stored.get("school_digest_highlights") or {})
-                for p, lines in school_updates.items():
-                    current["school_digest_highlights"].setdefault(p, []).extend(lines)
             save_snapshot(current)
             print("Updates sent to Discord; snapshot updated.", file=sys.stderr)
         except Exception as e:
@@ -204,15 +175,7 @@ def main() -> int:
         # Mon–Fri → current week; Sat–Sun → next week
         target_week, reference_date = _default_target_week_and_reference()
 
-    if config.USE_LLM_EXTRACTION:
-        raw_blocks = [
-            (person_name, class_label, raw_text, err)
-            for person_name, class_label, _url, raw_text, err in fetch_all_raw_school_texts()
-        ]
-        school_infos = None
-    else:
-        school_infos = fetch_all_school_info(target_week=target_week)
-        raw_blocks = None
+    school_infos = fetch_all_school_info(target_week=target_week)
 
     events_by_person: list[tuple[str, list]] = []
     calendar_error = None
@@ -221,27 +184,7 @@ def main() -> int:
     except Exception as e:
         calendar_error = str(e)
 
-    if config.USE_LLM_EXTRACTION:
-        has_openai_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-        if has_openai_key:
-            body = create_weekly_overview_from_raw(
-                raw_blocks,
-                events_by_person,
-                target_week,
-                calendar_error=calendar_error,
-                reference_date=reference_date,
-            )
-        else:
-            print("OPENAI_API_KEY not set; using template digest.", file=sys.stderr)
-            school_infos = _raw_blocks_to_school_infos(raw_blocks, target_week)
-            body = build_digest(
-                school_infos,
-                events_by_person,
-                calendar_error=calendar_error,
-                target_week=target_week,
-                reference_date=reference_date,
-            )
-    elif os.environ.get("OPENAI_API_KEY", "").strip():
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
         body = create_weekly_overview(
             school_infos,
             events_by_person,
@@ -260,15 +203,7 @@ def main() -> int:
 
     if args.save_snapshot:
         iso_year = (reference_date + timedelta(days=7)).isocalendar()[0]
-        snapshot = build_snapshot(
-            school_infos,
-            raw_blocks,
-            events_by_person,
-            target_week,
-            iso_year,
-            config.USE_LLM_EXTRACTION,
-            digest_body=body,
-        )
+        snapshot = build_snapshot(school_infos, events_by_person, target_week, iso_year, digest_body=body)
         save_snapshot(snapshot)
         print(f"Snapshot saved to {snapshot_path(iso_year, target_week)}", file=sys.stderr)
 
@@ -290,15 +225,7 @@ def main() -> int:
         send_digest(body)
         print("Digest sent to Discord.")
         iso_year = (reference_date + timedelta(days=7)).isocalendar()[0]
-        snapshot = build_snapshot(
-            school_infos,
-            raw_blocks,
-            events_by_person,
-            target_week,
-            iso_year,
-            config.USE_LLM_EXTRACTION,
-            digest_body=body,
-        )
+        snapshot = build_snapshot(school_infos, events_by_person, target_week, iso_year, digest_body=body)
         save_snapshot(snapshot)
         return 0
     except Exception as e:

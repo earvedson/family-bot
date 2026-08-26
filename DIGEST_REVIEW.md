@@ -1,3 +1,9 @@
+> **Historical.** This documents the regex/keyword filter tuning for the *old* rule-based
+> `school.py` (unstructured Google Sites page text). The school site since moved to a
+> structured Google Docs table format, and that whole filter layer was removed as part of the
+> rewrite — see `SCHOOL_SCRAPING_PLAN.md` for the current parser design. Kept for historical
+> context only; none of the specific rules below still exist in the code.
+
 # Digest preview review (target week 8)
 
 ## What looks good

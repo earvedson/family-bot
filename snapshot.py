@@ -1,12 +1,12 @@
 """
 Week snapshot for Sunday capture and weekday diff notifications.
 
-Snapshot format (JSON): iso_year, target_week, captured_at, school (highlights or hashes), calendar (events).
+Snapshot format (JSON): format_version, iso_year, target_week, captured_at,
+school_highlights, school_tests, calendar (events).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from datetime import datetime
@@ -17,6 +17,11 @@ import config
 
 # events_by_person: list of (person_name, list[CalendarEvent])
 # CalendarEvent has summary, start (datetime), end (optional), location (optional)
+
+# Bump when the snapshot dict shape changes. load_snapshot() treats a missing/mismatched
+# version as "no prior snapshot" (same as a missing file) rather than crashing on unfamiliar
+# keys or reporting an entire week as new against a snapshot built by old code.
+SNAPSHOT_FORMAT_VERSION = 2
 
 
 def parse_school_section_from_digest(digest_body: str, person_names: list[str]) -> dict[str, list[str]]:
@@ -79,21 +84,19 @@ def _event_key(ev: dict) -> tuple[str, str, str]:
 
 def build_snapshot(
     school_infos: list | None,
-    raw_blocks: list[tuple[str, str | None, str | None, str | None]] | None,
     events_by_person: list[tuple[str, list]],
     target_week: int,
     iso_year: int,
-    use_llm_extraction: bool,
     digest_body: str | None = None,
 ) -> dict:
     """
     Build a snapshot dict for the given week.
-    school_infos: list of SchoolInfo (rule-based path).
-    raw_blocks: list of (person_name, class_label, raw_text, error) (LLM path).
+    school_infos: list of SchoolInfo.
     events_by_person: list of (person_name, list[CalendarEvent]).
     digest_body: if provided, parse ## Skola and store school_digest_highlights (what we sent).
     """
     snapshot: dict[str, Any] = {
+        "format_version": SNAPSHOT_FORMAT_VERSION,
         "iso_year": iso_year,
         "target_week": target_week,
         "captured_at": datetime.now().isoformat(),
@@ -102,16 +105,16 @@ def build_snapshot(
     if digest_body:
         person_names = [p[0] for p in config.PERSON_SCHOOL]
         snapshot["school_digest_highlights"] = parse_school_section_from_digest(digest_body, person_names)
-    if use_llm_extraction and raw_blocks is not None:
-        snapshot["school_hashes"] = {}
-        for person_name, _cl, raw_text, err in raw_blocks:
-            text = (raw_text or "").strip()
-            h = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            snapshot["school_hashes"][person_name] = h
-    elif school_infos is not None:
+    if school_infos is not None:
         snapshot["school_highlights"] = {}
+        snapshot["school_tests"] = {}
         for info in school_infos:
             snapshot["school_highlights"][info.person_name] = list(info.highlights or [])
+            # "weekday|description" strings so a newly-scheduled test is diffable regardless of
+            # where/how the digest chooses to render it (see SCHOOL_SCRAPING_PLAN.md §4).
+            snapshot["school_tests"][info.person_name] = [
+                f"{weekday}|{desc}" for weekday, desc in (getattr(info, "tests", None) or [])
+            ]
     for person_name, events in events_by_person:
         person = person_name or "Övrigt"
         for e in events:
@@ -142,11 +145,14 @@ def save_snapshot(snapshot: dict, path: Path | None = None) -> None:
 
 
 def load_snapshot(iso_year: int, target_week: int) -> dict | None:
-    """Load snapshot for the given week; None if missing."""
+    """Load snapshot for the given week; None if missing or from an incompatible older format."""
     path = snapshot_path(iso_year, target_week)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("format_version") != SNAPSHOT_FORMAT_VERSION:
+        return None
+    return data
 
 
 def diff_snapshots(
@@ -156,19 +162,23 @@ def diff_snapshots(
     """
     Compare stored and current snapshots.
     Returns (school_changed_persons, new_calendar_events).
-    School: if hashes, list person names where hash changed; if highlights, list person names with new lines (we treat any new line as "changed" for that person).
+    School: list of person names with new highlight lines and/or new tests (any addition counts
+    as "changed" for that person - highlights and tests are diffed independently so a newly
+    scheduled test is caught even though it isn't rendered as a highlight).
     Calendar: list of event dicts that are in current but not in stored (by person+start+summary).
     """
     school_changed: list[str] = []
-    if "school_hashes" in stored and "school_hashes" in current:
-        for person, cur_h in current["school_hashes"].items():
-            if stored["school_hashes"].get(person) != cur_h:
-                school_changed.append(person)
-    elif "school_highlights" in stored and "school_highlights" in current:
+    if "school_highlights" in stored and "school_highlights" in current:
         for person, cur_highlights in current["school_highlights"].items():
             stored_set = set(stored["school_highlights"].get(person) or [])
             cur_set = set(cur_highlights or [])
             if cur_set - stored_set:
+                school_changed.append(person)
+    if "school_tests" in stored and "school_tests" in current:
+        for person, cur_tests in current["school_tests"].items():
+            stored_set = set(stored["school_tests"].get(person) or [])
+            cur_set = set(cur_tests or [])
+            if (cur_set - stored_set) and person not in school_changed:
                 school_changed.append(person)
     stored_keys = {_event_key(e) for e in stored.get("calendar") or []}
     new_events: list[dict] = []

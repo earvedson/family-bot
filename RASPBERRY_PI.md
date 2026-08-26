@@ -44,7 +44,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-This installs: `httpx`, `beautifulsoup4`, `icalendar`, `recurring-ical-events`, `openai` (see `requirements.txt`).
+This installs: `httpx`, `beautifulsoup4`, `icalendar`, `recurring-ical-events`, `anthropic` (see `requirements.txt`).
 
 ---
 
@@ -59,7 +59,7 @@ This installs: `httpx`, `beautifulsoup4`, `icalendar`, `recurring-ical-events`, 
   - **PERSON_SCHOOL** – Required. Format: `Name|ClassLabel|URL` per person, comma-separated (e.g. `Olle|8B|https://...,Elsa|6B|https://...`).
 - Optional but recommended:
   - **PERSON_CALENDARS** – `Names|ICS_URL` (e.g. `Familjen|webcal://...`). Use name "Familjen" for shared family calendar.
-  - **OPENAI_API_KEY** and **USE_LLM_EXTRACTION=1** – For LLM-generated digest (single API call per week).
+  - **ANTHROPIC_API_KEY** – For a Claude-written digest (single API call per week) instead of the template. Get a key at console.anthropic.com (separate from a claude.ai Pro/Max subscription).
   - **CALENDAR_TIMEZONE** – e.g. `Europe/Stockholm` (default).
 
 The app loads `.env` from the current working directory when you run the script (`config.py`), so cron must run from the project directory.
@@ -77,7 +77,7 @@ python run_weekly.py --dry-run
 
 - Digest is written to `digest_preview.txt`. Open it to confirm school and calendar content look correct.
 - If you use the LLM, you should see `Using model: ...` on stderr.
-- If something fails (e.g. missing `OPENAI_API_KEY` or `openai`), the script prints a short message to stderr and falls back to the template digest.
+- If something fails (e.g. missing `ANTHROPIC_API_KEY` or the `anthropic` package), the script prints a short message to stderr and falls back to the template digest.
 
 Then do a **real send** once to verify Discord:
 
@@ -163,7 +163,7 @@ flowchart LR
   Code --> Venv --> Env --> Test --> Cron
   Cron -->|Sunday or Monday| run_weekly[run_weekly.py]
   run_weekly -->|HTTPS| Discord[Discord webhook]
-  run_weekly -->|Optional| OpenAI[OpenAI API]
+  run_weekly -->|Optional| Claude[Anthropic API]
 ```
 
 **Quick checklist:** Python 3.10+, clone/copy project → `python3 -m venv .venv` → `source .venv/bin/activate` → `pip install -r requirements.txt` → `cp .env.example .env` and edit → `python run_weekly.py --dry-run` → `python run_weekly.py` → `crontab -e` with `cd /path/to/family-bot && .venv/bin/python run_weekly.py` at desired time.
