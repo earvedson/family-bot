@@ -181,28 +181,34 @@ def _fetch_doc_html(doc_id: str, cache: dict[str, str], timeout: float = 20.0) -
 # ---------------------------------------------------------------------------
 
 
-def _rich_text(node, drop_classroom_links: bool) -> str:
-    """Render a node's text, turning <a href> into markdown links (or dropping Classroom links)."""
+def _rich_text(node) -> str:
+    """Render a node's text as plain text - never as a markdown/HTML link.
+
+    Google Classroom links are dropped entirely (their visible text is usually a meaningless
+    join code). Any other hyperlink (Docs, Drive, Sheets) keeps its visible label but not the
+    URL: posting a raw Google URL in a Discord message auto-unfurls into a link-preview embed,
+    and since these docs are typically not publicly accessible, that embed is a "Sign in -
+    Google Accounts" card with a Sign In button - noise at best, confusing at worst. Never
+    include the href in digest output.
+    """
     if isinstance(node, NavigableString):
         return str(node)
     if getattr(node, "name", None) == "br":
         return " "  # a <br> inside one <p> separates lines that must not run together
     if getattr(node, "name", None) == "a" and node.get("href"):
         href = _unwrap_google_redirect(node["href"])
-        inner = "".join(_rich_text(c, drop_classroom_links) for c in node.children).strip()
-        if drop_classroom_links and "classroom.google.com" in href:
+        inner = "".join(_rich_text(c) for c in node.children).strip()
+        if "classroom.google.com" in href:
             return ""
-        if not inner:
-            return ""
-        return f"[{inner}]({href})"
-    return "".join(_rich_text(c, drop_classroom_links) for c in getattr(node, "children", []))
+        return inner
+    return "".join(_rich_text(c) for c in getattr(node, "children", []))
 
 
-def _cell_paragraph_texts(cell, drop_classroom_links: bool) -> list[str]:
+def _cell_paragraph_texts(cell) -> list[str]:
     paragraphs = cell.find_all("p") or [cell]
     out = []
     for p in paragraphs:
-        text = " ".join(_rich_text(p, drop_classroom_links).split())
+        text = " ".join(_rich_text(p).split())
         if text:
             out.append(text)
     return out
@@ -218,7 +224,7 @@ def _subject_name_from_cell(cell) -> str:
     lowercase-alnum token containing a digit (subject names here are capitalized Swedish words;
     join codes are lowercase and, in every code observed so far, contain at least one digit).
     """
-    paras = _cell_paragraph_texts(cell, drop_classroom_links=True)
+    paras = _cell_paragraph_texts(cell)
     if not paras:
         return ""
     text = paras[0].strip().rstrip(":").strip()
@@ -227,7 +233,7 @@ def _subject_name_from_cell(cell) -> str:
 
 
 def _cell_text(cell) -> str:
-    return " ".join(_cell_paragraph_texts(cell, drop_classroom_links=False))
+    return " ".join(_cell_paragraph_texts(cell))
 
 
 # ---------------------------------------------------------------------------
