@@ -31,16 +31,16 @@ cp .env.example .env
 
 - **DISCORD_WEBHOOK_URL** – Skapa en Incoming Webhook i Discord: Kanalinställningar → Integrations → Webhooks → New Webhook, kopiera URL.
 - **PERSON_SCHOOL** – Person + klass: format `Name|ClassLabel|URL`, kommaseparerat. T.ex. `Alice|6B|https://...,Bob|8B|https://...`. Namn och klassetikett (6B, 8B) är konfigurerbara; byt vid behov när klasser/år ändras.
-- **SPECIAL_INFO_&lt;Name&gt;** – Valfritt. Per-person notiser (t.ex. ämnesbyten: "Bild (inte Musik); Slöjd (inte Hemkunskap)"). Namnet ska matcha PERSON_SCHOOL; nyckeln är SPECIAL_INFO_ + namnet i versaler med mellanslag ersatta med understreck (t.ex. `SPECIAL_INFO_OLLE=...`). Visas i digesten och skickas till LLM som kontext.
+- **SPECIAL_INFO_&lt;Name&gt;** – Valfritt. Per-person notiser (t.ex. ämnesbyten: "Franska, Tyska (har Spanska istället)"). Namnet ska matcha PERSON_SCHOOL; nyckeln är SPECIAL_INFO_ + namnet i versaler med mellanslag ersatta med understreck (t.ex. `SPECIAL_INFO_OLLE=...`). Visas i digesten som en notis – filtrerar inget i sig.
+- **SUPPRESS_SUBJECTS_&lt;Name&gt;** – Valfritt. Kommaseparerad lista med ämnen som ska uteslutas helt ur personens Skola-avsnitt (t.ex. ett ämne de inte läser), matchas skiftlägesokänsligt mot "Ämne"-kolumnen i veckoplaneringen. Samma namnformat som SPECIAL_INFO. T.ex. `SUPPRESS_SUBJECTS_OLLE=Franska,Tyska`.
 - **PERSON_CALENDARS** – Valfritt. Kalender kopplad till person(er): format `Names|ICS_URL`. `Names` är ett namn eller flera med `;` (t.ex. `Alice;Bob` = kalender för båda). Samma person kan ha flera kalendrar genom flera rader. Digesten grupperar händelser per person.
 - **ICS_URLS** – Valfritt (fallback). Global kalender om PERSON_CALENDARS inte är satt. Kommaseparerade ICS-URL:er.
-- **OPENAI_API_KEY** – Valfritt. Om satt skickas skol- och kalenderdata till en LLM som skriver hela veckosammanfattningen (rubrik, inledning, Skola, Kalender). Kräver `pip install openai`. Modell: **OPENAI_DIGEST_MODEL** (standard: gpt-4o-mini).
-- **USE_LLM_EXTRACTION** – Valfritt. Sätt till `1` (eller `true`/`yes`) för att skicka rå sidtext per barn + kalender i ett enda LLM-anrop som returnerar hela veckosammanfattningen. Rekommenderas om innehållet saknas eller regelbaserat filter blir fel; kräver **OPENAI_API_KEY**.
+- **ANTHROPIC_API_KEY** – Valfritt. Om satt skickas skol- och kalenderdata till Claude som skriver hela veckosammanfattningen (rubrik, inledning, Skola, Kalender). Kräver `pip install anthropic`. Skaffa en nyckel på [console.anthropic.com](https://console.anthropic.com) (separat från en claude.ai Pro/Max-prenumeration – det här debiteras per token). Modell: **ANTHROPIC_DIGEST_MODEL** (standard: `claude-sonnet-5`).
 - **CALENDAR_TIMEZONE** – Valfritt. Tidszon för kalenderveckan och händelsetider (t.ex. Europe/Stockholm). Standard: Europe/Stockholm.
 
-**Kalender:** Händelser hämtas för nästa veckas måndag–söndag (samma vecka som skolinfo). I digesten visas kalendern **dag för dag**: under varje veckodag (t.ex. "Måndag 17 februari") listas vad varje person har den dagen. Om du har en kalender med namnet **Familjen** (t.ex. `Familjen|webcal://...`) tolkas den som att hela familjen gör något tillsammans; det nämns i veckosammanfattningen högst upp.
+**Kalender:** Händelser hämtas för nästa veckas måndag–söndag (samma vecka som skolinfo). I digesten visas kalendern **dag för dag**: under varje veckodag (t.ex. "Måndag 17 februari") listas vad varje person har den dagen, inklusive skolprov (se nedan). Om du har en kalender med namnet **Familjen** (t.ex. `Familjen|webcal://...`) tolkas den som att hela familjen gör något tillsammans; det nämns i veckosammanfattningen högst upp.
 
-**Veckofilter (skola):** Skolsidorna är ofta ostrukturerade och listar planering för många veckor. Boten fokuserar på *nästa vecka* (räknat från kördatum). Två lägen: (1) **Regelbaserat** (standard): `school.py` filtrerar rader som nämner nästa vecka; om OPENAI_API_KEY är satt skriver LLM hela digesten utifrån den data. (2) **USE_LLM_EXTRACTION=1**: Ett enda LLM-anrop får rå sidtext per barn och kalender, extraherar skolinfo för nästa vecka och skriver hela veckosammanfattningen – ofta bättre när sidor varierar i upplägg. Kör gärna söndag så att "nästa vecka" blir veckan som börjar måndag.
+**Skola:** `school.py` förväntar sig en Google Sites-klassida som länkar vidare till två Google Docs: ett **provschema** (terminslångt, delat mellan syskonens klasser) och en **veckoplanering** (klass-specifik, en tabell per vecka). Båda hämtas anonymt via Google Docs export och parsas som strukturerade tabeller – inget regelbaserat textfilter behövs längre. Provscheman ger daterade prov som läggs in i kalendern dag-för-dag; veckoplaneringen ger ämnesvis planering/läxor under Skola-rubriken. Om veckoplaneringen inte hunnit uppdateras för målveckan visas det tydligt i digesten istället för att tyst visa fel veckas innehåll. Om ANTHROPIC_API_KEY är satt skriver Claude hela digesten utifrån den extraherade datan, annars används mallen (`build_digest`).
 
 Om du publicerar repot: alla känsliga och hemspecifika värden ska ligga i `.env`. Committa bara `.env.example` (utan riktiga värden). Kontrollera att `.env` finns i `.gitignore`.
 
@@ -91,10 +91,10 @@ Se till att cron har tillgång till samma miljö om du använder `.env` (kör fr
 ## Projektstruktur
 
 - `config.py` – Läser URL:er och webhook från miljö/`.env`
-- `school.py` – Hämtar och parsar konfigurerade klassidor (prov, läxor, förhör); filtrerar till nästa vecka
+- `school.py` – Hämtar klassidan, hittar länkarna till provschema/veckoplanering (Google Docs), och parsar dem som strukturerade tabeller för målveckan
 - `cal_fetcher.py` – Hämtar ICS för måndag–söndag i målveckan, händelser per person; återkommande händelser (RRULE) expanderas till varje förekomst (kräver `recurring-ical-events`)
 - `digest.py` – Bygger meddelandet (skola + kalender dag för dag)
-- `llm_improve.py` – Valfritt: skickar digesten till en LLM för förtydligande, veckofilter på Skola-delen och sammanfattning (kräver OPENAI_API_KEY)
+- `llm_improve.py` – Valfritt: skickar skol- och kalenderdata till Claude, som skriver hela veckosammanfattningen (kräver ANTHROPIC_API_KEY)
 - `discord_notify.py` – Skickar till Discord via webhook
 - `run_weekly.py` – Entry point för cron; `--check-updates` för vardagsdiff och notis
 - `snapshot.py` – Sparar och jämför veckodata (söndag = spara, vardag = diff + notis vid ändringar)

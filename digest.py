@@ -55,7 +55,7 @@ def _dedupe_events_same_day(
     events: list[CalendarEvent],
     tz: ZoneInfo | None,
 ) -> list[CalendarEvent]:
-    """Keep one event per (summary, location) per list; prefer timed over all-day (midnight)."""
+    """Keep one event per (summary, location) per list; prefer timed over all-day."""
     if not events or len(events) <= 1:
         return events
     key_to_events: dict[tuple[str, str], list[CalendarEvent]] = defaultdict(list)
@@ -64,14 +64,11 @@ def _dedupe_events_same_day(
         key_to_events[(e.summary.strip(), loc)].append(e)
     result: list[CalendarEvent] = []
     for key, group in key_to_events.items():
-        def is_all_day(ev: CalendarEvent) -> bool:
-            if tz is not None and ev.start.tzinfo is not None:
-                local = ev.start.astimezone(tz)
-            else:
-                local = ev.start
-            return local.hour == 0 and local.minute == 0
-        # Prefer timed event over all-day (midnight)
-        group_sorted = sorted(group, key=is_all_day)
+        # Prefer timed event over all-day. all_day is set at ICS-parse time from whether the
+        # source value was a DATE vs a DATETIME - not inferred from local hour==0, which breaks
+        # for any timezone ahead of UTC (an all-day event stored as UTC midnight is never local
+        # midnight there, e.g. 02:00 in Europe/Stockholm during summer).
+        group_sorted = sorted(group, key=lambda ev: ev.all_day)
         result.append(group_sorted[0])
     result.sort(key=lambda x: x.start)
     return result
@@ -79,13 +76,10 @@ def _dedupe_events_same_day(
 
 def _format_event_short(e: CalendarEvent, tz: ZoneInfo | None) -> str:
     """One event as 'HH:MM – Summary (location)' or 'Heldag – Summary'."""
-    if tz is not None and e.start.tzinfo is not None:
-        local = e.start.astimezone(tz)
-    else:
-        local = e.start
-    if local.hour == 0 and local.minute == 0:
+    if e.all_day:
         time_str = "Heldag"
     else:
+        local = e.start.astimezone(tz) if (tz is not None and e.start.tzinfo is not None) else e.start
         time_str = local.strftime("%H:%M")
     part = f"{time_str} – {e.summary}"
     if e.location:
@@ -109,11 +103,70 @@ def _school_heading_from_info(info: SchoolInfo) -> str:
     return info.person_name
 
 
-def _school_heading_from_name_class(person_name: str, class_label: str | None) -> str:
-    """Display heading for one person (Name or Name (ClassLabel))."""
-    if class_label:
-        return f"{person_name} ({class_label})"
-    return person_name
+def _format_test_short(description: str) -> str:
+    """One Provschema test entry, e.g. '**PROV** – spanska, franska'."""
+    return f"**PROV** – {description}"
+
+
+_WEEKDAY_SV_INDEX = {name.lower(): i for i, name in enumerate(_WEEKDAY_SV)}
+
+
+def _target_week_tests_by_date(
+    school_infos: list[SchoolInfo] | None,
+    week_dates: list[date],
+) -> dict[date, list[tuple[str, str]]]:
+    """Map date -> [(person_name, description)] for this-week tests (SchoolInfo.tests).
+
+    Tests are dated by weekday name (from Provschema), not by datetime, so they're placed onto
+    week_dates by weekday index rather than going through the calendar-event grouping machinery.
+    """
+    out: dict[date, list[tuple[str, str]]] = defaultdict(list)
+    for info in school_infos or []:
+        for weekday_name, description in getattr(info, "tests", None) or []:
+            idx = _WEEKDAY_SV_INDEX.get(weekday_name.strip().lower())
+            if idx is None or idx >= len(week_dates):
+                continue
+            out[week_dates[idx]].append((info.person_name, description))
+    return dict(out)
+
+
+def _render_school_person_block(info: SchoolInfo, target_week: int | None) -> list[str]:
+    """
+    Lines describing one person's Skola block: heading, current-info note, publish status,
+    highlights (weekly plan/homework - no tests, those are dated and shown in the calendar
+    section), special-info note, upcoming-tests lookahead, and any parse warnings.
+
+    Shared between the template digest and the LLM payload so both see the same picture.
+    """
+    heading = _school_heading_from_info(info)
+    if info.error:
+        return [f"**{heading}:** Kunde inte hämta sidan – {info.error}"]
+
+    lines: list[str] = [f"**{heading}:**"]
+    if info.info_note:
+        lines.append(f"*Aktuellt: {info.info_note}*")
+    if info.status == "week_not_published":
+        if info.latest_week_available is not None:
+            lines.append(
+                f"*Veckoplaneringen är inte uppdaterad för vecka {target_week} än "
+                f"(senast uppdaterad: vecka {info.latest_week_available}).*"
+            )
+        else:
+            lines.append("*Veckoplaneringen är inte uppdaterad ännu.*")
+    if info.highlights:
+        lines.extend(info.highlights)
+    elif info.status == "ok":
+        lines.append("Inga prov/läxor/förhör hittade denna vecka.")
+    special = config.get_special_info(info.person_name)
+    if special:
+        lines.append(f"*({info.person_name} har {special} denna termin.)*")
+    if info.upcoming_tests:
+        lines.append("**Kommande prov:**")
+        for week, weekday, desc in info.upcoming_tests:
+            lines.append(f"- v{week} {weekday}: {desc}")
+    for w in info.warnings:
+        lines.append(f"*(Obs: {w})*")
+    return lines
 
 
 def _serialize_calendar_for_llm(
@@ -121,32 +174,43 @@ def _serialize_calendar_for_llm(
     target_week: int,
     calendar_error: str | None = None,
     reference_date: date | None = None,
+    school_infos: list[SchoolInfo] | None = None,
 ) -> str:
-    """Serialize only the calendar section for the LLM (day-by-day, person/events)."""
+    """Serialize the calendar section for the LLM (day-by-day, person/events), tests merged in."""
     lines: list[str] = []
     lines.append(f"KALENDER (vecka {target_week})")
     lines.append("---")
     if calendar_error:
         lines.append(f"Kalenderfel: {calendar_error}")
         lines.append("")
-    if events_by_person and target_week is not None:
+    week_dates = _week_dates(target_week, reference_date) if target_week is not None else []
+    tests_by_date = _target_week_tests_by_date(school_infos, week_dates) if target_week is not None else {}
+    if target_week is not None and (events_by_person or tests_by_date):
         try:
             tz = ZoneInfo(config.CALENDAR_TIMEZONE) if config.CALENDAR_TIMEZONE else None
         except Exception:
             tz = None
-        week_dates = _week_dates(target_week, reference_date)
         by_day = _events_by_day_and_person(events_by_person)
         for d in week_dates:
             weekday_sv = _WEEKDAY_SV[d.weekday()]
             month_sv = _MONTH_SV[d.month - 1]
             lines.append(f"{weekday_sv} {d.day} {month_sv}:")
             persons_events = by_day.get(d, {})
-            if not persons_events:
+            day_tests = tests_by_date.get(d, [])
+            if not persons_events and not day_tests:
                 lines.append("  Inga händelser.")
             else:
-                for person_name in sorted(persons_events.keys()):
-                    deduped = _dedupe_events_same_day(persons_events[person_name], tz)
+                all_persons = sorted(set(persons_events.keys()) | {p for p, _ in day_tests})
+                for person_name in all_persons:
+                    deduped = _dedupe_events_same_day(persons_events.get(person_name, []), tz)
                     event_strs = [_format_event_short(e, tz) for e in deduped]
+                    existing_summaries = {
+                        (e.summary or "").strip().lower() for e in persons_events.get(person_name, [])
+                    }
+                    for p_name, desc in day_tests:
+                        if p_name != person_name or desc.strip().lower() in existing_summaries:
+                            continue
+                        event_strs.append(_format_test_short(desc))
                     lines.append(f"  {person_name}: " + ". ".join(event_strs))
             lines.append("")
     else:
@@ -172,73 +236,14 @@ def serialize_school_and_calendar_for_llm(
     lines.append("SKOLA")
     lines.append("---")
     for info in school_infos:
-        heading = _school_heading_from_info(info)
-        if info.error:
-            lines.append(f"{heading}: Fel – {info.error}")
-        elif info.highlights:
-            lines.append(f"{heading}:")
-            for h in info.highlights:
-                lines.append(f"- {h}")
-        else:
-            lines.append(f"{heading}: Inga prov/läxor/förhör denna vecka.")
+        lines.extend(_render_school_person_block(info, target_week))
         lines.append("")
     lines.append("---")
     lines.append("")
     lines.append(_serialize_calendar_for_llm(
-        events_by_person, target_week, calendar_error, reference_date
+        events_by_person, target_week, calendar_error, reference_date, school_infos=school_infos
     ))
     return "\n".join(lines).strip()
-
-
-# Total payload cap (chars) for raw-school + calendar single-call
-_RAW_PAYLOAD_CAP = 30_000
-
-
-def serialize_raw_school_and_calendar_for_llm(
-    raw_blocks: list[tuple[str, str | None, str | None, str | None]],
-    events_by_person: list[tuple[str, list[CalendarEvent]]],
-    target_week: int,
-    calendar_error: str | None = None,
-    reference_date: date | None = None,
-) -> str:
-    """
-    Serialize raw school page text (per person) + calendar for a single LLM call.
-    raw_blocks: list of (person_name, class_label, raw_text, error) per school page.
-    Keeps total payload under _RAW_PAYLOAD_CAP; reserves space for calendar,
-    splits the rest evenly across persons (truncating each raw_text if needed).
-    """
-    calendar_section = _serialize_calendar_for_llm(
-        events_by_person, target_week, calendar_error, reference_date
-    )
-    header_lines = [f"VECKA: {target_week}", "", "SKOLA", "---"]
-    header = "\n".join(header_lines) + "\n"
-    trailer = "\n---\n\n" + calendar_section
-    school_budget = _RAW_PAYLOAD_CAP - len(header) - len(trailer) - 200
-    n = max(1, len(raw_blocks))
-    per_person = max(500, school_budget // n)
-    lines: list[str] = list(header_lines)
-    for person_name, class_label, raw_text, err in raw_blocks:
-        heading = _school_heading_from_name_class(person_name, class_label)
-        if err:
-            lines.append(f"--- SKOLA: {heading} ---")
-            lines.append(f"{heading}: Fel – {err}")
-        else:
-            text = (raw_text or "").strip()
-            if len(text) > per_person:
-                text = text[: per_person - 20] + "\n... [trunkerad]"
-            lines.append(f"--- SKOLA: {heading} ---")
-            special = config.get_special_info(person_name)
-            if special:
-                lines.append(f"Observera: {special}.")
-            lines.append(text)
-        lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append(calendar_section)
-    payload = "\n".join(lines).strip()
-    if len(payload) > _RAW_PAYLOAD_CAP:
-        payload = payload[: _RAW_PAYLOAD_CAP - 50] + "\n... [payload trunkerad]"
-    return payload
 
 
 def build_digest(
@@ -293,22 +298,10 @@ def build_digest(
     parts.append("## Skola")
     any_school_error = False
     for info in school_infos:
-        heading = _school_heading_from_info(info)
+        parts.extend(_render_school_person_block(info, target_week))
+        parts.append("")
         if info.error:
-            parts.append(f"**{heading}:** Kunde inte hämta sidan – {info.error}")
             any_school_error = True
-        elif info.highlights:
-            parts.append(f"**{heading}:**")
-            for h in info.highlights:
-                parts.append(h)
-            parts.append("")
-        else:
-            parts.append(f"**{heading}:** Inga prov/läxor/förhör hittade denna vecka.")
-            parts.append("")
-        special = config.get_special_info(info.person_name)
-        if special:
-            parts.append(f"*({info.person_name} har {special} denna termin.)*")
-            parts.append("")
     if any_school_error:
         parts.append("*(Kontrollera att skolsidorna är tillgängliga.)*")
         parts.append("")
@@ -320,22 +313,32 @@ def build_digest(
         tz = None
 
     parts.append("## Kalender" + (f" (vecka {target_week})" if target_week is not None else ""))
+    week_dates = _week_dates(target_week, reference_date) if target_week is not None else []
+    tests_by_date = _target_week_tests_by_date(school_infos, week_dates) if target_week is not None else {}
     if calendar_error:
         parts.append(f"*Kunde inte hämta kalender: {calendar_error}*")
-    elif events_by_person and target_week is not None:
-        week_dates = _week_dates(target_week, reference_date)
+    elif target_week is not None and (events_by_person or tests_by_date):
         by_day = _events_by_day_and_person(events_by_person)
         for d in week_dates:
             weekday_sv = _WEEKDAY_SV[d.weekday()]
             month_sv = _MONTH_SV[d.month - 1]
             parts.append(f"### {weekday_sv} {d.day} {month_sv}")
             persons_events = by_day.get(d, {})
-            if not persons_events:
+            day_tests = tests_by_date.get(d, [])
+            if not persons_events and not day_tests:
                 parts.append("Inga händelser.")
             else:
-                for person_name in sorted(persons_events.keys()):
-                    deduped = _dedupe_events_same_day(persons_events[person_name], tz)
+                all_persons = sorted(set(persons_events.keys()) | {p for p, _ in day_tests})
+                for person_name in all_persons:
+                    deduped = _dedupe_events_same_day(persons_events.get(person_name, []), tz)
                     event_strs = [_format_event_short(e, tz) for e in deduped]
+                    existing_summaries = {
+                        (e.summary or "").strip().lower() for e in persons_events.get(person_name, [])
+                    }
+                    for p_name, desc in day_tests:
+                        if p_name != person_name or desc.strip().lower() in existing_summaries:
+                            continue
+                        event_strs.append(_format_test_short(desc))
                     parts.append(f"**{person_name}:** " + ". ".join(event_strs))
             parts.append("")
     elif events_by_person:

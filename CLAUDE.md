@@ -29,25 +29,19 @@ validate changes (inspect `digest_preview.txt`).
 
 ## Architecture: the pipeline
 
-`run_weekly.py` is the only entry point and orchestrates a linear pipeline. Two independent axes
-of behavior determine which functions actually run:
+`run_weekly.py` is the only entry point and orchestrates a linear pipeline. School parsing
+(`school.fetch_all_school_info`) always runs the same way — it's structured extraction, not a
+filter with an on/off mode (see "School parsing" below). The one remaining axis is **whether
+`ANTHROPIC_API_KEY` is set**, which decides how the already-extracted `SchoolInfo` list and calendar
+data become digest text:
 
-1. **`config.USE_LLM_EXTRACTION`** — whether school-page parsing is rule-based or LLM-based.
-2. **Whether `OPENAI_API_KEY` is set** — whether the final digest text is LLM-written or template-built.
-
-This gives four effective code paths through `run_weekly.py::main`, all converging on either
-`digest.build_digest()` (template) or one of the `llm_improve.create_weekly_overview*()` functions
-(LLM writes the whole digest and falls back to `build_digest()` on any API failure):
-
-| USE_LLM_EXTRACTION | OPENAI_API_KEY | School parsing | Digest writer |
-|---|---|---|---|
-| off | unset | `school.fetch_all_school_info` (regex/keyword filter) | `digest.build_digest` |
-| off | set | same | `llm_improve.create_weekly_overview` |
-| on | unset | `school.fetch_all_raw_school_texts` (raw text, no filtering) | `_raw_blocks_to_school_infos` → `digest.build_digest` |
-| on | set | same raw fetch | `llm_improve.create_weekly_overview_from_raw` (single LLM call does extraction *and* writing) |
+| ANTHROPIC_API_KEY | Digest writer |
+|---|---|
+| unset | `digest.build_digest` (template) |
+| set | `llm_improve.create_weekly_overview` (Claude writes the whole digest via the Anthropic Messages API; falls back to `build_digest` on any API failure) |
 
 Calendar fetching (`cal_fetcher.fetch_events_for_week`) is independent of this and always runs the
-same way regardless of the axes above.
+same way.
 
 **Target week resolution** (`run_weekly.py`): with no `--week`, Mon–Fri runs target the *current*
 ISO week, Sat–Sun runs target *next* week (so a Sunday-evening cron run produces next week's
@@ -59,34 +53,67 @@ purely to resolve the correct ISO year when a week number could span two years.
 referenced by name elsewhere. `config.PERSON_CALENDARS` (`Names|ICS_URL`, `;`-joined names for a
 shared calendar) is independently configured — calendar people and school people don't have to be
 the same set. A calendar named `Familjen` is special-cased in `digest.build_digest` as "whole
-family together" and surfaced at the top of the digest.
+family together" and surfaced at the top of the digest. Two optional per-person env vars, keyed the
+same way (`<PREFIX>_<NAME>`, name uppercased/underscored): `SPECIAL_INFO_<NAME>` is a free-text note
+shown in the digest (doesn't filter anything); `SUPPRESS_SUBJECTS_<NAME>` is a comma-separated list
+of subject names (matched case-insensitively against Veckoplanering's "Ämne" column) actually
+filtered out of that person's `highlights` in `school.py` — e.g. a subject they don't take.
 
-**School parsing** (`school.py`, rule-based path): fetches page text via BeautifulSoup, splits it
-into segments by `SUBJECT_HEADERS`, and keeps lines matching `IMPORTANT_KEYWORDS` (prov/läxa/etc.)
-or a week reference (`WEEK_REF`). `_line_applies_to_week` keeps lines mentioning the target week
-±1 or with no week ref at all (ambiguous → kept), drops lines that are purely past weeks. There's
-special-cased handling for "Engelska" sections where a lone week-range line (e.g. "Week 3 - 8")
-pulls in following lines as context, since that subject's content is often split oddly. This logic
-was tuned empirically — see `DIGEST_REVIEW.md` for the reasoning behind specific filter rules
-before changing them.
+
+**School parsing** (`school.py`): the class landing page (Google Sites) is just a directory —
+`_discover_source_links` fetches it and finds two outbound Google Doc links by label text (with an
+ancestor-text fallback, since Google Sites sometimes renders a link's label on a parent `<div>`
+rather than the `<a>` itself): a **Provschema** (term-long test schedule, one table per ISO week,
+shared across a whole class-year "lag" so it's fetched once per run and memoized by doc ID) and a
+**Veckoplanering** (class-specific weekly plan, one 3-column subject table per week, reused/edited
+by the teacher every week). Both are fetched via `docs.google.com/document/d/{id}/export?format=html`
+(works anonymously for public docs) and parsed as structured tables — there's no regex/keyword
+filtering layer since subject and week are given by table position, not inferred from free text.
+
+`parse_veckoplanering` walks the doc as a small state machine keyed off `Vecka: N` paragraphs, and
+is deliberately tolerant of teacher error: a week block whose header row doesn't match the expected
+columns is treated as unparseable (warning) rather than guessed at; duplicate week numbers keep
+whichever block has more content (warning). A `Vecka: MALL` template block that was filled in but
+never renumbered is detected but **never** substituted for a missing target week — on the real
+document this template turned out to hold stale leftovers from a *previous* week (reused as
+scaffolding), not pre-filled upcoming content, so showing it under the target week's heading would
+misinform rather than help; it's logged to stderr for the maintainer only, since it's the
+document's steady state rather than a per-run anomaly worth repeating in every digest.
+`SchoolInfo.status == "week_not_published"` is set instead — this is expected on an unqualified
+Sunday-evening run, which targets *next* week (see "Target week resolution" below) before the
+teacher has filled that block in. Provschema, being pre-filled weeks ahead, still surfaces tests
+for such weeks via `SchoolInfo.tests` (this week, dated by weekday) and `.upcoming_tests` (next
+`UPCOMING_TEST_WEEKS_AHEAD` weeks) even when the weekly plan hasn't caught up.
+`SchoolInfo.class_label` is load-bearing here — it selects the Provschema column, and a mismatch
+against that doc's class-label headers is a surfaced warning, not a silent empty result.
+
+`digest.py` merges `SchoolInfo.tests` into the day-by-day calendar view (see "Calendar fetching"
+below) rather than showing them in the Skola section, since they're now dated;
+`.upcoming_tests` renders as a "Kommande prov" lookahead under each person's Skola block instead,
+since it spans weeks outside the day-by-day loop's range.
 
 **Calendar fetching** (`cal_fetcher.py`): computes the Monday–Sunday range for the target week in
 `CALENDAR_TIMEZONE`, expands recurring events (RRULE) via `recurring_ical_events` (falls back to
 non-expanded + date-filter if that package is missing), and attributes each event to a person only
 if a name in `all_names` appears in the event summary — otherwise the event is shown to everyone
 sharing that calendar. `digest.py` further dedupes same-day events with identical
-(summary, location), preferring a timed instance over a midnight/all-day one.
+(summary, location), preferring a timed instance over a midnight/all-day one. Provschema test
+entries (`SchoolInfo.tests`) are placed into the same day-by-day view by weekday name, deduped
+against a real calendar event only on an exact summary match (deliberately not fuzzy — see
+`SCHOOL_SCRAPING_PLAN.md` §4 for why).
 
 **Snapshot/diff** (`snapshot.py`, used by `--check-updates`): Sunday's full run saves a JSON
-snapshot per `(iso_year, target_week)` under `config.DIGEST_SNAPSHOT_DIR`. Weekday
+snapshot per `(iso_year, target_week)` under `config.DIGEST_SNAPSHOT_DIR`, tagged with
+`SNAPSHOT_FORMAT_VERSION` — `load_snapshot` treats a missing/mismatched version as no prior
+snapshot (same as a missing file) rather than diffing against an incompatible shape. Weekday
 `--check-updates` runs refetch, build a fresh snapshot, and diff against the stored one:
-- School diff: compares `school_hashes` (LLM-extraction path, hash of raw text) or `school_highlights`
-  (rule-based path, set difference on highlight lines) — whichever key the stored snapshot has.
+- School diff: set difference on `school_highlights` (weekly-plan/homework lines) and, separately,
+  on `school_tests` (`"weekday|description"` strings) — a newly-scheduled test is diffable even
+  though it's rendered in the calendar section, not as a highlight.
 - Calendar diff: new events are those whose `(person, start, summary)` key isn't in the stored set.
-- If a full digest was sent (not just extracted), `snapshot.parse_school_section_from_digest`
-  parses the actual `## Skola` markdown back out into `school_digest_highlights`, so weekday diffs
-  can report only the *new* lines actually sent (via `llm_improve.get_new_school_items_only`)
-  instead of just "page changed".
+- If a full digest was sent, `snapshot.parse_school_section_from_digest` additionally parses the
+  actual `## Skola` markdown back out into `school_digest_highlights` (informational baseline of
+  what was actually sent; not currently used for diffing).
 
 **Discord delivery** (`discord_notify.py`): splits on 2000-char limit by paragraph (`\n\n`) first,
 falling back to line splits for an oversized single paragraph; prepends `@here` to the first chunk.
@@ -96,6 +123,5 @@ falling back to line splits for an oversized single paragraph; prepends `@here` 
 All configuration is env vars loaded from `.env` by `config.py` (simple hand-rolled parser, no
 external dependency) at import time. See `.env.example` for the full list and format of each
 variable (`PERSON_SCHOOL`, `SPECIAL_INFO_<NAME>`, `PERSON_CALENDARS`, `ICS_URLS`,
-`CALENDAR_TIMEZONE`, `OPENAI_API_KEY`/`OPENAI_DIGEST_MODEL`, `USE_LLM_EXTRACTION`,
-`DIGEST_SNAPSHOT_DIR`). Never commit `.env` — it's gitignored; only `.env.example` (no real values)
-should be committed.
+`CALENDAR_TIMEZONE`, `ANTHROPIC_API_KEY`/`ANTHROPIC_DIGEST_MODEL`, `DIGEST_SNAPSHOT_DIR`). Never commit
+`.env` — it's gitignored; only `.env.example` (no real values) should be committed.
