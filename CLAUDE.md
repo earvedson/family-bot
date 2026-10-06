@@ -57,7 +57,10 @@ family together" and surfaced at the top of the digest. Two optional per-person 
 same way (`<PREFIX>_<NAME>`, name uppercased/underscored): `SPECIAL_INFO_<NAME>` is a free-text note
 shown in the digest (doesn't filter anything); `SUPPRESS_SUBJECTS_<NAME>` is a comma-separated list
 of subject names (matched case-insensitively against Veckoplanering's "Ämne" column) actually
-filtered out of that person's `highlights` in `school.py` — e.g. a subject they don't take.
+filtered out of that person's `highlights` in `school.py` — e.g. a subject they don't take. It
+also applies to Provschema tests (`_filter_test_description`): those are free text, so the class's
+Veckoplanering subject names are used as the vocabulary — an entry mentioning only suppressed
+subjects is dropped, a shared one ("Prov spanska, franska och tyska") is shortened to the rest.
 
 
 **School parsing** (`school.py`): the class landing page (Google Sites) is just a directory —

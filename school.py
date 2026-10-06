@@ -43,6 +43,8 @@ _HEADER_KEYWORDS = ("ämne", "veckans planering", "övrigt")
 # Fallback for an un-hyperlinked Classroom join code left as plain text after the subject name
 # (e.g. "NO 6ehmkgbq") - lowercase alnum, 4-12 chars, containing at least one digit.
 _TRAILING_CLASSROOM_CODE_RE = re.compile(r"\s+(?=[a-z0-9]*\d)[a-z0-9]{4,12}$")
+# Separators in a Provschema subject list, e.g. "Prov spanska, franska och tyska".
+_TEST_LIST_SEP_RE = re.compile(r"\s*,\s*|\s+och\s+", re.IGNORECASE)
 
 
 @dataclass
@@ -447,6 +449,41 @@ def _collect_tests_for_week(
     return out
 
 
+def _mentions(text: str, name: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE) is not None
+
+
+def _filter_test_description(text: str, suppressed: set[str], known_subjects: set[str]) -> Optional[str]:
+    """
+    Remove suppressed subjects from a free-text Provschema entry. Returns None if the entry is
+    only about suppressed subjects, otherwise the (possibly shortened) text.
+
+    known_subjects (casefolded, from the class's Veckoplanering) tells which words in the free
+    text are subjects at all: an entry is dropped when every subject it mentions is suppressed
+    ("Tyska – textskrivning utan hjälpmedel"). Entries are often a shared test for several
+    subjects ("Prov spanska, franska och tyska"), so a mixed entry is shortened to the remaining
+    subjects ("Prov spanska") when it's a plain list, and otherwise kept as-is.
+    """
+    if not suppressed:
+        return text
+    hit = {s for s in suppressed if _mentions(text, s)}
+    if not hit:
+        return text
+    if known_subjects and not any(_mentions(text, k) for k in known_subjects - suppressed):
+        return None
+    items = [i.strip() for i in _TEST_LIST_SEP_RE.split(text.strip())]
+    # The first item usually carries a label before the subject ("Prov spanska") - peel it off.
+    prefix = ""
+    first_words = items[0].split()
+    if len(first_words) > 1:
+        prefix, items[0] = " ".join(first_words[:-1]), first_words[-1]
+    kept = [i for i in items if i.casefold() not in suppressed]
+    if not kept or len(kept) == len(items):
+        return text  # not a plain subject list - keep rather than guess
+    joined = kept[0] if len(kept) == 1 else ", ".join(kept[:-1]) + " och " + kept[-1]
+    return f"{prefix} {joined}".strip()
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -481,6 +518,8 @@ def fetch_school_info_for_person(
         shown = ", ".join(links.unclassified_labels[:3])
         warnings.append(f"Kunde inte känna igen {len(links.unclassified_labels)} länk(ar) på sidan: {shown}")
 
+    suppressed = config.get_suppressed_subjects(person_name)
+    known_subjects: set[str] = set()  # casefolded subject names (+ first word, "Spanska Niklas")
     highlights: list[str] = []
     info_note: Optional[str] = None
     status = "ok"
@@ -495,6 +534,10 @@ def fetch_school_info_for_person(
             html = _fetch_doc_html(links.veckoplanering_id, _doc_cache)
             blocks, vp_warnings, _fallback_block = parse_veckoplanering(html)
             warnings.extend(vp_warnings)
+            for b in blocks.values():
+                for name in b.subjects:
+                    known_subjects.add(name.casefold())
+                    known_subjects.add(name.split()[0].casefold())
         except Exception as e:
             warnings.append(f"Kunde inte läsa veckoplaneringen – {e}")
         if target_week is not None:
@@ -502,7 +545,6 @@ def fetch_school_info_for_person(
             if block is not None:
                 week_matched = target_week
                 info_note = block.info or None
-                suppressed = config.get_suppressed_subjects(person_name)
                 for subject, cell in block.subjects.items():
                     if subject.strip().casefold() in suppressed:
                         continue
@@ -540,10 +582,15 @@ def fetch_school_info_for_person(
                 f"Klass '{class_label}' hittades inte i provschemat; kolumner: " + ", ".join(sorted(known_classes))
             )
         elif target_week is not None:
-            tests = _collect_tests_for_week(provschema_weeks, target_week, class_norm)
+            for weekday, desc in _collect_tests_for_week(provschema_weeks, target_week, class_norm):
+                desc = _filter_test_description(desc, suppressed, known_subjects)
+                if desc:
+                    tests.append((weekday, desc))
             for w in range(target_week + 1, target_week + 1 + UPCOMING_TEST_WEEKS_AHEAD):
                 for weekday, desc in _collect_tests_for_week(provschema_weeks, w, class_norm):
-                    upcoming_tests.append((w, weekday, desc))
+                    desc = _filter_test_description(desc, suppressed, known_subjects)
+                    if desc:
+                        upcoming_tests.append((w, weekday, desc))
 
     return SchoolInfo(
         person_name=person_name,
