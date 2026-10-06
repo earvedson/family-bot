@@ -121,6 +121,16 @@ snapshot (same as a missing file) rather than diffing against an incompatible sh
 **Discord delivery** (`discord_notify.py`): splits on 2000-char limit by paragraph (`\n\n`) first,
 falling back to line splits for an oversized single paragraph; prepends `@here` to the first chunk.
 
+## Deploying to the Raspberry Pi
+
+Production runs via cron on a Raspberry Pi on the home network (setup: `RASPBERRY_PI.md`). Its
+host/user are deliberately not in this repo (it's public) — they're in the maintainer's Obsidian
+vault note `~/Obsidian/Personal/2. Areas/family-bot.md`, which also lists any **pending deploy
+steps** left by a session on another machine. Read it whenever asked to deploy/update the Pi, and
+tick off/remove the pending steps once done. A deploy is: push to `main`, `git pull` in the project
+dir on the Pi, and apply any `.env` changes there by hand (`.env` isn't in git). The Pi is only
+reachable from the home network.
+
 ## Config
 
 All configuration is env vars loaded from `.env` by `config.py` (simple hand-rolled parser, no
