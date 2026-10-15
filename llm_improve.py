@@ -87,13 +87,19 @@ Uppgift: Skriv den färdiga veckosammanfattningen på svenska i följande format
     try:
         resp = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=8192,
             system=system,
             messages=[{"role": "user", "content": payload[:30000]}],
         )
-        text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        if text:
-            return text
+        if resp.stop_reason == "max_tokens":
+            print(
+                "Anthropic response hit max_tokens (truncated digest); fallback to template digest.",
+                file=sys.stderr,
+            )
+        else:
+            text = "".join(b.text for b in resp.content if b.type == "text").strip()
+            if text:
+                return text
     except Exception as e:
         print(f"Anthropic API error (fallback to template digest): {e}", file=sys.stderr)
     return build_digest(
