@@ -118,23 +118,16 @@ snapshot (same as a missing file) rather than diffing against an incompatible sh
   actual `## Skola` markdown back out into `school_digest_highlights` (informational baseline of
   what was actually sent; not currently used for diffing).
 
-**Discord delivery** (`discord_notify.py`): splits on 2000-char limit by paragraph (`\n\n`) first,
-falling back to line splits for an oversized single paragraph; prepends `@here` to the first chunk.
-
 ## Deploying to the Raspberry Pi
 
-Production runs via cron on a Raspberry Pi on the home network (setup: `RASPBERRY_PI.md`). Its
-host/user are deliberately not in this repo (it's public) — they're in the maintainer's Obsidian
-vault note `~/Obsidian/Personal/2. Areas/family-bot.md`, which also lists any **pending deploy
-steps** left by a session on another machine. Read it whenever asked to deploy/update the Pi, and
-tick off/remove the pending steps once done. A deploy is: push to `main`, `git pull` in the project
-dir on the Pi, and apply any `.env` changes there by hand (`.env` isn't in git). The Pi is only
-reachable from the home network.
+Production runs via cron on a Raspberry Pi. Its host/user are deliberately not in this repo (it's
+public) — never add them. They, plus any **pending deploy steps** left by a session on another
+machine, live in the maintainer's Obsidian note `~/Obsidian/Personal/2. Areas/family-bot.md`.
+Use the `deploy-pi` skill for the deploy workflow.
 
 ## Config
 
 All configuration is env vars loaded from `.env` by `config.py` (simple hand-rolled parser, no
 external dependency) at import time. See `.env.example` for the full list and format of each
-variable (`PERSON_SCHOOL`, `SPECIAL_INFO_<NAME>`, `PERSON_CALENDARS`, `ICS_URLS`,
-`CALENDAR_TIMEZONE`, `ANTHROPIC_API_KEY`/`ANTHROPIC_DIGEST_MODEL`, `DIGEST_SNAPSHOT_DIR`). Never commit
+variable. Never commit
 `.env` — it's gitignored; only `.env.example` (no real values) should be committed.
